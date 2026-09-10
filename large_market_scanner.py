@@ -23,9 +23,11 @@ from rich.table import Table
 # CONFIG
 # ==========================================
 WEBULL_PATH = r"C:\Users\sophi\go\bin\webull.exe"
-MIN_PRICE = 0.50
+MIN_PRICE = 2.00
 MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
+MIN_VOLUME = 1_000_000
+MIN_FLOAT = 2_000_000
 BATCH_SIZE = 100
 TOP_N = 20
 WORKERS = 4
@@ -104,14 +106,16 @@ def parse_results(raw):
             vol = int(item.get("volume", 0))
             sym = item.get("symbol", "")
             pct = float(item.get("change_ratio", 0)) * 100
+            fp = float(item.get("float_shares", 0)) if item.get("float_shares") else 0
             ep = item.get("extend_hour_last_price")
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
             oc = item.get("ovn_change_ratio")
-            if price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
+            if (price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT 
+                and pre > 0 and vol >= MIN_VOLUME and (fp == 0 or fp >= MIN_FLOAT)):
                 out.append({
                     "symbol": sym, "price": price, "prev_close": pre,
-                    "change_pct": pct, "volume": vol,
+                    "change_pct": pct, "volume": vol, "float": fp,
                     "ext_price": float(ep) if ep else None,
                     "ext_change_pct": float(ec) * 100 if ec else None,
                     "ext_vol": None,
@@ -215,15 +219,18 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=N
     t.add_column("Ovn$", style="magenta", width=10, justify="right")
     t.add_column("Ovn%", style="magenta", width=8, justify="right")
     t.add_column("Vol", style="dim", width=12, justify="right")
+    t.add_column("Float", style="dim", width=10, justify="right")
 
     for i, r in enumerate(results[:TOP_N], 1):
         ep = f"${r['ext_price']:.2f}" if r.get("ext_price") else "-"
         ec = f"{r['ext_change_pct']:+.2f}%" if r.get("ext_change_pct") is not None else "-"
         op = f"${r['ovn_price']:.2f}" if r.get("ovn_price") else "-"
         oc = f"{r['ovn_change_pct']:+.2f}%" if r.get("ovn_change_pct") is not None else "-"
+        fl = r.get("float", 0)
+        fl_str = f"{fl/1e6:.1f}M" if fl >= 1e6 else (f"{fl/1e3:.0f}K" if fl >= 1e3 else str(fl)) if fl > 0 else "-"
         t.add_row(
             str(i), r["symbol"], f"${r['price']:.2f}", f"+{r['change_pct']:.2f}%",
-            ep, ec, op, oc, f"{r['volume']:,}",
+            ep, ec, op, oc, f"{r['volume']:,}", fl_str,
         )
     return t
 
@@ -305,38 +312,70 @@ def run_scanner(symbols, cache):
         prog.update(tid, description=f"[bold green]Scan done. Cache: {cache.count()}/{len(symbols)}. Saving...[/bold green]")
         cache.save()
         time.sleep(1)
-        prog.update(tid, description="[bold green]Tick-by-tick...[/bold green]")
 
-        # Phase 2: Tick-by-tick for top stocks
+        # Phase 2: Rescan every 3 seconds
+        scan_count = 0
         while not stop_event.is_set():
+            scan_count += 1
+
             if paused.is_set():
                 while paused.is_set():
-                    live.update(layout("tick"))
+                    live.update(layout("scan"))
                     time.sleep(0.2)
                 continue
 
-            top = cache.top_n(TOP_N)
-            top_syms = [r["symbol"] for r in top]
+            prog.update(tid, advance=0, description=f"[bold blue]Rescan #{scan_count}...[/bold blue]")
+            
+            failed_batches = []
+            batch_scanned = 0
+            for i in range(0, len(batches), WORKERS):
+                if stop_event.is_set():
+                    break
+                group = batches[i:i+WORKERS]
+                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                    futs = {ex.submit(fetch_batch, b): b for b in group}
+                    for f in as_completed(futs):
+                        try:
+                            raw = f.result()
+                            parsed = parse_results(raw)
+                            if parsed:
+                                cache.update(parsed)
+                            else:
+                                failed_batches.append(futs[f])
+                        except Exception:
+                            failed_batches.append(futs[f])
+                        batch_scanned += len(futs[f])
+                        prog.update(tid, advance=len(futs[f]),
+                                    description=f"[blue]Rescan #{scan_count}: {batch_scanned}/{len(symbols)}[/blue]")
+                time.sleep(0.2)
 
-            try:
-                raw = fetch_batch(top_syms)
-                results = parse_results(raw)
-                if results:
-                    for r in results:
-                        sym = r["symbol"]
-                        new_price = r["price"]
-                        old_price = prev_prices.get(sym)
-                        if old_price is not None and new_price != old_price:
-                            tick_count += 1
-                        prev_prices[sym] = new_price
-                    cache.update(results)
-                    if tick_count % 10 == 0:
-                        cache.save()
-            except Exception:
-                pass
+            # Retry failed
+            if failed_batches:
+                time.sleep(3)
+                for i in range(0, len(failed_batches), WORKERS):
+                    if stop_event.is_set():
+                        break
+                    group = failed_batches[i:i+WORKERS]
+                    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                        futs = {ex.submit(fetch_batch, b): b for b in group}
+                        for f in as_completed(futs):
+                            try:
+                                raw = f.result()
+                                parsed = parse_results(raw)
+                                if parsed:
+                                    cache.update(parsed)
+                            except Exception:
+                                pass
+                    time.sleep(0.3)
 
-            live.update(layout("tick"))
-            time.sleep(TICK_INTERVAL)
+            cache.save()
+            live.update(layout("scan"))
+            
+            # Wait 3 seconds between rescans
+            for _ in range(30):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.1)
 
 
 def main():
@@ -356,6 +395,7 @@ def main():
         f"{len(symbols)} symbols | "
         f"{MIN_CHANGE_PCT}%+ | "
         f"${MIN_PRICE}-${MAX_PRICE} | "
+        f"Vol>1M | Float>2M | "
         f"[bold yellow]SPACE pause | T stop[/bold yellow]"
     )
 
