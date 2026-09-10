@@ -34,7 +34,7 @@ WORKERS = 2
 BATCH_SIZE = 50
 STOCK_DB = "stock_cache.db"
 HTTP_TIMEOUT = 20
-BATCH_DELAY = 0.3
+BATCH_DELAY = 1.5
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -98,14 +98,14 @@ def fetch_batch(symbols, retry=3):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        time.sleep(3 * (attempt + 1))
+                        time.sleep(5 * (attempt + 1))
                         continue
                     return []
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(3)
+                time.sleep(5)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -233,7 +233,6 @@ def run_scanner(symbols, total):
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
         # Full scan on startup - parallel batches
         scanned = 0
-        failed = []
         for i in range(0, len(batches), WORKERS):
             if stop_event.is_set():
                 break
@@ -259,12 +258,13 @@ def run_scanner(symbols, total):
                                 prev_prices[sym] = new_price
                             cache.update(results)
                     except Exception:
-                        failed.append(futs[f])
+                        pass
                     scanned += len(futs[f])
                     pct = (scanned / total * 100) if total > 0 else 0
                     filled = int(20 * scanned / total) if total > 0 else 0
                     bar = "█" * filled + "░" * (20 - filled)
                     prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
+            live.update(layout("scan"))
             time.sleep(BATCH_DELAY)
 
         # Quick refresh loop: top 20 every 3s
