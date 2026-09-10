@@ -1,6 +1,6 @@
 """
-Momentum Scanner - Direct CLI scanner, no pre-caching needed
-Uses SEC Edgar database for ticker list, Webull CLI for live prices
+Momentum Scanner - FAST
+Uses Webull CLI snapshot endpoint in large batches for speed
 """
 import os
 import sys
@@ -30,11 +30,9 @@ MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 TOP_N = 20
-WORKERS = 2
-BATCH_SIZE = 50
+BATCH_SIZE = 100
 STOCK_DB = "stock_cache.db"
 HTTP_TIMEOUT = 20
-BATCH_DELAY = 1.5
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -65,7 +63,6 @@ def key_listener():
 
 def load_symbols():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
     db_path = os.path.join(script_dir, STOCK_DB)
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
@@ -75,18 +72,16 @@ def load_symbols():
         conn.close()
         if symbols:
             return symbols
-    
     txt_path = os.path.join(script_dir, "master_list.txt")
     if os.path.exists(txt_path):
         with open(txt_path, "r") as f:
             return [line.strip().upper() for line in f if line.strip()]
-    
     return []
 
 
-def fetch_batch(symbols, retry=3):
+def fetch_batch(symbols):
     sym_str = ",".join(symbols)
-    for attempt in range(retry + 1):
+    for attempt in range(3):
         try:
             result = subprocess.run(
                 [WEBULL_PATH, "data", "stock", "snapshot",
@@ -97,19 +92,12 @@ def fetch_batch(symbols, retry=3):
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
-                    if attempt < retry:
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    return []
+                    time.sleep(5 * (attempt + 1))
+                    continue
                 if isinstance(data, list):
                     return data
-        except subprocess.TimeoutExpired:
-            if attempt < retry:
-                time.sleep(5)
-                continue
-        except (json.JSONDecodeError, Exception):
-            pass
-        break
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+            time.sleep(2)
     return []
 
 
@@ -128,17 +116,7 @@ def parse_results(raw):
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
             oc = item.get("ovn_change_ratio")
-            
-            passes = True
-            reasons = []
-            if price < MIN_PRICE: passes = False; reasons.append(f"price={price}")
-            if price > MAX_PRICE: passes = False; reasons.append(f"price={price}")
-            if pct < MIN_CHANGE_PCT: passes = False; reasons.append(f"chg={pct:.2f}")
-            if pre <= 0: passes = False; reasons.append("pre_close=0")
-            if vol < MIN_VOLUME: passes = False; reasons.append(f"vol={vol}")
-            if fp < MIN_FLOAT: passes = False; reasons.append(f"float={fp}")
-            
-            if passes:
+            if price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
                 out.append({
                     "symbol": sym, "instrument_id": inst_id,
                     "price": price, "prev_close": pre,
@@ -231,9 +209,9 @@ def run_scanner(symbols, total):
         return lo
 
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Full scan on startup - parallel batches
+        # Phase 1: Full scan - 4 workers, 100 per batch, fast
         scanned = 0
-        for i in range(0, len(batches), WORKERS):
+        for i in range(0, len(batches), 4):
             if stop_event.is_set():
                 break
             if paused.is_set():
@@ -241,8 +219,8 @@ def run_scanner(symbols, total):
                     live.update(layout())
                     time.sleep(0.2)
 
-            group = batches[i:i+WORKERS]
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            group = batches[i:i+4]
+            with ThreadPoolExecutor(max_workers=4) as ex:
                 futs = {ex.submit(fetch_batch, b): b for b in group}
                 for f in as_completed(futs):
                     try:
@@ -265,9 +243,9 @@ def run_scanner(symbols, total):
                     bar = "█" * filled + "░" * (20 - filled)
                     prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
             live.update(layout("scan"))
-            time.sleep(BATCH_DELAY)
+            time.sleep(0.5)
 
-        # Quick refresh loop: top 20 every 3s
+        # Phase 2: Quick refresh - top stocks every 3s
         while not stop_event.is_set():
             if paused.is_set():
                 while paused.is_set():
@@ -307,7 +285,7 @@ def main():
         console.print("[red]No symbols found[/red]")
         sys.exit(1)
 
-    console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols loaded")
+    console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols | 4 workers")
     console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+[/dim]")
     console.print(f"[bold yellow]SPACE pause | T stop[/bold yellow]")
 
