@@ -27,6 +27,7 @@ MIN_PRICE = 2.00
 MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
+MIN_FLOAT = 2_000_000
 BATCH_SIZE = 100
 TOP_N = 20
 WORKERS = 4
@@ -105,15 +106,16 @@ def parse_results(raw):
             vol = int(item.get("volume", 0))
             sym = item.get("symbol", "")
             pct = float(item.get("change_ratio", 0)) * 100
+            fp = float(item.get("out_standing_shares", 0)) if item.get("out_standing_shares") else 0
             ep = item.get("extend_hour_last_price")
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
             oc = item.get("ovn_change_ratio")
             if (price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT 
-                and pre > 0 and vol >= MIN_VOLUME):
+                and pre > 0 and vol >= MIN_VOLUME and fp >= MIN_FLOAT):
                 out.append({
                     "symbol": sym, "price": price, "prev_close": pre,
-                    "change_pct": pct, "volume": vol,
+                    "change_pct": pct, "volume": vol, "float": fp,
                     "ext_price": float(ep) if ep else None,
                     "ext_change_pct": float(ec) * 100 if ec else None,
                     "ext_vol": None,
@@ -217,15 +219,18 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=N
     t.add_column("Ovn$", style="magenta", width=10, justify="right")
     t.add_column("Ovn%", style="magenta", width=8, justify="right")
     t.add_column("Vol", style="dim", width=12, justify="right")
+    t.add_column("Float", style="dim", width=10, justify="right")
 
     for i, r in enumerate(results[:TOP_N], 1):
         ep = f"${r['ext_price']:.2f}" if r.get("ext_price") else "-"
         ec = f"{r['ext_change_pct']:+.2f}%" if r.get("ext_change_pct") is not None else "-"
         op = f"${r['ovn_price']:.2f}" if r.get("ovn_price") else "-"
         oc = f"{r['ovn_change_pct']:+.2f}%" if r.get("ovn_change_pct") is not None else "-"
+        fl = r.get("float", 0)
+        fl_str = f"{fl/1e6:.1f}M" if fl >= 1e6 else (f"{fl/1e3:.0f}K" if fl >= 1e3 else str(fl)) if fl > 0 else "-"
         t.add_row(
             str(i), r["symbol"], f"${r['price']:.2f}", f"+{r['change_pct']:.2f}%",
-            ep, ec, op, oc, f"{r['volume']:,}",
+            ep, ec, op, oc, f"{r['volume']:,}", fl_str,
         )
     return t
 
@@ -390,7 +395,7 @@ def main():
         f"{len(symbols)} symbols | "
         f"{MIN_CHANGE_PCT}%+ | "
         f"${MIN_PRICE}-${MAX_PRICE} | "
-        f"Vol>1M | "
+        f"Vol>1M | Float>2M | "
         f"[bold yellow]SPACE pause | T stop[/bold yellow]"
     )
 
