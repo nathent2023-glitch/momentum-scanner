@@ -255,7 +255,8 @@ def run_scanner(symbols, cache):
         return lo
 
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Phase 1: CLI scan
+        # Phase 1: CLI scan with retry for failed batches
+        failed_batches = []
         for i in range(0, len(batches), WORKERS):
             if paused.is_set():
                 while paused.is_set():
@@ -269,17 +270,42 @@ def run_scanner(symbols, cache):
                 for f in as_completed(futs):
                     try:
                         raw = f.result()
-                        cache.update(parse_results(raw))
+                        parsed = parse_results(raw)
+                        if parsed:
+                            cache.update(parsed)
+                        else:
+                            failed_batches.append(futs[f])
                     except Exception:
-                        pass
+                        failed_batches.append(futs[f])
                     scanned += len(futs[f])
                     prog.update(tid, advance=len(futs[f]),
                                 description=f"CLI: {scanned}/{len(symbols)}")
             time.sleep(0.2)
 
-        prog.update(tid, description="[bold green]Scan done. Saving cache...[/bold green]")
+        # Retry failed batches
+        if failed_batches:
+            prog.update(tid, description=f"Retrying {len(failed_batches)} failed batches...")
+            time.sleep(5)
+            for i in range(0, len(failed_batches), WORKERS):
+                if stop_event.is_set():
+                    break
+                group = failed_batches[i:i+WORKERS]
+                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                    futs = {ex.submit(fetch_batch, b): b for b in group}
+                    for f in as_completed(futs):
+                        try:
+                            raw = f.result()
+                            parsed = parse_results(raw)
+                            if parsed:
+                                cache.update(parsed)
+                        except Exception:
+                            pass
+                time.sleep(0.5)
+
+        prog.update(tid, description=f"[bold green]Scan done. Cache: {cache.count()}/{len(symbols)}. Saving...[/bold green]")
         cache.save()
-        prog.update(tid, description="[bold green]Scan done. Tick-by-tick...[/bold green]")
+        time.sleep(1)
+        prog.update(tid, description="[bold green]Tick-by-tick...[/bold green]")
 
         # Phase 2: Tick-by-tick for top stocks
         while not stop_event.is_set():
