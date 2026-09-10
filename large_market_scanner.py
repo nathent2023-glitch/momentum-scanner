@@ -30,6 +30,7 @@ MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 TOP_N = 20
+WORKERS = 4
 BATCH_SIZE = 100
 STOCK_DB = "stock_cache.db"
 HTTP_TIMEOUT = 20
@@ -243,7 +244,7 @@ def run_scanner(symbols, total):
                     bar = "█" * filled + "░" * (20 - filled)
                     prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
             live.update(layout("scan"))
-            time.sleep(0.5)
+            time.sleep(0.3)
 
         # Phase 2: Quick refresh - top stocks every 3s
         while not stop_event.is_set():
