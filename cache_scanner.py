@@ -10,7 +10,6 @@ import subprocess
 import threading
 import signal
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
 from rich.live import Live
@@ -25,10 +24,10 @@ MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
-BATCH_SIZE = 100
-WORKERS = 2
+BATCH_SIZE = 50
 CACHE_FILE = "scanner_cache.json"
-HTTP_TIMEOUT = 15
+HTTP_TIMEOUT = 20
+BATCH_DELAY = 0.5
 
 stop_event = threading.Event()
 
@@ -47,7 +46,7 @@ def load_symbols(file_path):
         return [line.strip().upper() for line in f if line.strip()]
 
 
-def fetch_batch(symbols, retry=3):
+def fetch_batch(symbols, retry=4):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
         try:
@@ -69,7 +68,7 @@ def fetch_batch(symbols, retry=3):
                     return data, False
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(3)
+                time.sleep(5)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -96,13 +95,9 @@ def parse_results(raw):
             if (price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT 
                 and pre > 0 and vol >= MIN_VOLUME and fp >= MIN_FLOAT):
                 out.append({
-                    "symbol": sym,
-                    "instrument_id": inst_id,
-                    "price": price,
-                    "prev_close": pre,
-                    "change_pct": pct,
-                    "volume": vol,
-                    "float": fp,
+                    "symbol": sym, "instrument_id": inst_id,
+                    "price": price, "prev_close": pre,
+                    "change_pct": pct, "volume": vol, "float": fp,
                     "ext_price": float(ep) if ep else None,
                     "ext_change_pct": float(ec) * 100 if ec else None,
                     "ext_vol": None,
@@ -170,71 +165,59 @@ def main():
         sys.exit(1)
 
     cache = StockCache()
-    last_scan, cached_count = cache.load()
+    cache.load()
     
     console.print(f"[bold green]Caching {len(symbols)} stocks...[/bold green]")
-    console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+ change[/dim]")
+    console.print(f"[dim]Batch size: {BATCH_SIZE} | Single worker | 0.5s delay[/dim]")
 
     batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     scanned = 0
     failed_batches = []
 
     with Live(console=console, refresh_per_second=4) as live:
-        for i in range(0, len(batches), WORKERS):
+        # Single worker - one batch at a time
+        for i, batch in enumerate(batches):
             if stop_event.is_set():
                 break
 
-            group = batches[i:i+WORKERS]
-            rate_limited = False
-            
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                futs = {ex.submit(fetch_batch, b): b for b in group}
-                for f in as_completed(futs):
-                    try:
-                        raw, was_limited = f.result()
-                        parsed = parse_results(raw)
-                        if parsed:
-                            cache.update(parsed)
-                            rate_limited = False
-                        else:
-                            if was_limited:
-                                failed_batches.append(futs[f])
-                                rate_limited = True
-                    except Exception:
-                        failed_batches.append(futs[f])
-                    scanned += len(futs[f])
-                    pct = (scanned / len(symbols) * 100) if len(symbols) > 0 else 0
-                    filled = int(20 * scanned / len(symbols)) if len(symbols) > 0 else 0
-                    bar = "█" * filled + "░" * (20 - filled)
-                    live.update(Panel(
-                        f"[blue]{scanned}/{len(symbols)} {bar} {pct:.0f}%[/blue]",
-                        title="Caching"
-                    ))
-            
-            if rate_limited:
-                time.sleep(2)
-            else:
-                time.sleep(0.3)
+            raw, was_limited = fetch_batch(batch)
+            parsed = parse_results(raw)
+            if parsed:
+                cache.update(parsed)
+            elif was_limited:
+                failed_batches.append(batch)
 
-        # Retry failed
+            scanned += len(batch)
+            pct = (scanned / len(symbols) * 100) if len(symbols) > 0 else 0
+            filled = int(20 * scanned / len(symbols)) if len(symbols) > 0 else 0
+            bar = "█" * filled + "░" * (20 - filled)
+            live.update(Panel(
+                f"[blue]{scanned}/{len(symbols)} {bar} {pct:.0f}%[/blue] | "
+                f"Cache: {cache.count()} stocks | Failed: {len(failed_batches)}",
+                title=f"Caching batch {i+1}/{len(batches)}"
+            ))
+            
+            if was_limited:
+                time.sleep(3)
+            else:
+                time.sleep(BATCH_DELAY)
+
+        # Retry failed with longer delays
         if failed_batches and not stop_event.is_set():
-            live.update(Panel(f"[yellow]Retrying {len(failed_batches)} failed...[/yellow]", title="Caching"))
-            time.sleep(10)
-            for i in range(0, len(failed_batches), WORKERS):
+            live.update(Panel(f"[yellow]Retrying {len(failed_batches)} failed batches...[/yellow]", title="Caching"))
+            time.sleep(15)
+            for i, batch in enumerate(failed_batches):
                 if stop_event.is_set():
                     break
-                group = failed_batches[i:i+WORKERS]
-                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                    futs = {ex.submit(fetch_batch, b): b for b in group}
-                    for f in as_completed(futs):
-                        try:
-                            raw, _ = f.result()
-                            parsed = parse_results(raw)
-                            if parsed:
-                                cache.update(parsed)
-                        except Exception:
-                            pass
-                time.sleep(1)
+                raw, _ = fetch_batch(batch, retry=5)
+                parsed = parse_results(raw)
+                if parsed:
+                    cache.update(parsed)
+                live.update(Panel(
+                    f"[yellow]Retry {i+1}/{len(failed_batches)} | Cache: {cache.count()}[/yellow]",
+                    title="Retrying"
+                ))
+                time.sleep(2)
 
     count = cache.count()
     if count > 0:
