@@ -63,17 +63,25 @@ def key_listener():
         time.sleep(0.05)
 
 
-def load_symbols_from_db():
+def load_symbols():
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    
     db_path = os.path.join(script_dir, STOCK_DB)
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("SELECT ticker FROM stocks WHERE length(ticker) <= 5")
-    symbols = [r[0].upper() for r in c.fetchall()]
-    conn.close()
-    return symbols
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT ticker FROM stocks WHERE length(ticker) >= 1 AND length(ticker) <= 5")
+        symbols = [r[0].upper() for r in c.fetchall()]
+        conn.close()
+        if symbols:
+            return symbols
+    
+    txt_path = os.path.join(script_dir, "master_list.txt")
+    if os.path.exists(txt_path):
+        with open(txt_path, "r") as f:
+            return [line.strip().upper() for line in f if line.strip()]
+    
+    return []
 
 
 def fetch_batch(symbols, retry=3):
@@ -120,8 +128,17 @@ def parse_results(raw):
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
             oc = item.get("ovn_change_ratio")
-            if (price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT 
-                and pre > 0 and vol >= MIN_VOLUME and fp >= MIN_FLOAT):
+            
+            passes = True
+            reasons = []
+            if price < MIN_PRICE: passes = False; reasons.append(f"price={price}")
+            if price > MAX_PRICE: passes = False; reasons.append(f"price={price}")
+            if pct < MIN_CHANGE_PCT: passes = False; reasons.append(f"chg={pct:.2f}")
+            if pre <= 0: passes = False; reasons.append("pre_close=0")
+            if vol < MIN_VOLUME: passes = False; reasons.append(f"vol={vol}")
+            if fp < MIN_FLOAT: passes = False; reasons.append(f"float={fp}")
+            
+            if passes:
                 out.append({
                     "symbol": sym, "instrument_id": inst_id,
                     "price": price, "prev_close": pre,
@@ -285,9 +302,9 @@ def run_scanner(symbols, total):
 
 def main():
     console = Console()
-    symbols = load_symbols_from_db()
+    symbols = load_symbols()
     if not symbols:
-        console.print("[red]No symbols found in stock_cache.db[/red]")
+        console.print("[red]No symbols found[/red]")
         sys.exit(1)
 
     console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols loaded")
