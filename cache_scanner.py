@@ -13,7 +13,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from rich.live import Live
 from rich.panel import Panel
 
 # ==========================================
@@ -175,19 +175,11 @@ def main():
     console.print(f"[bold green]Caching {len(symbols)} stocks...[/bold green]")
     console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+ change[/dim]")
 
-    prog = Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=None),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeRemainingColumn(),
-    )
-    tid = prog.add_task("Starting...", total=len(symbols))
-
     batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     scanned = 0
     failed_batches = []
 
-    with Progress(prog, console=console) as progress:
+    with Live(console=console, refresh_per_second=4) as live:
         for i in range(0, len(batches), WORKERS):
             if stop_event.is_set():
                 break
@@ -211,8 +203,13 @@ def main():
                     except Exception:
                         failed_batches.append(futs[f])
                     scanned += len(futs[f])
-                    progress.update(tid, advance=len(futs[f]),
-                                    description=f"Caching: {scanned}/{len(symbols)}")
+                    pct = (scanned / len(symbols) * 100) if len(symbols) > 0 else 0
+                    filled = int(20 * scanned / len(symbols)) if len(symbols) > 0 else 0
+                    bar = "█" * filled + "░" * (20 - filled)
+                    live.update(Panel(
+                        f"[blue]{scanned}/{len(symbols)} {bar} {pct:.0f}%[/blue]",
+                        title="Caching"
+                    ))
             
             if rate_limited:
                 time.sleep(2)
@@ -221,7 +218,7 @@ def main():
 
         # Retry failed
         if failed_batches and not stop_event.is_set():
-            progress.update(tid, description=f"Retrying {len(failed_batches)} failed...")
+            live.update(Panel(f"[yellow]Retrying {len(failed_batches)} failed...[/yellow]", title="Caching"))
             time.sleep(10)
             for i in range(0, len(failed_batches), WORKERS):
                 if stop_event.is_set():
