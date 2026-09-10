@@ -125,10 +125,39 @@ def parse_results(raw):
 
 
 class StockCache:
-    def __init__(self, max_size=CACHE_MAX):
+    def __init__(self, max_size=CACHE_MAX, cache_file="scanner_cache.json"):
         self._data = OrderedDict()
         self._max = max_size
         self._lock = threading.Lock()
+        self._cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_file)
+        self._loaded = False
+        self._last_scan = None
+        self.load()
+
+    def load(self):
+        if os.path.exists(self._cache_file):
+            try:
+                with open(self._cache_file, "r") as f:
+                    saved = json.load(f)
+                self._data = OrderedDict()
+                for item in saved.get("data", []):
+                    self._data[item["symbol"]] = item
+                self._last_scan = saved.get("timestamp")
+                self._loaded = True
+            except Exception:
+                self._loaded = False
+
+    def save(self):
+        try:
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "count": len(self._data),
+                "data": list(self._data.values()),
+            }
+            with open(self._cache_file, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
 
     def update(self, results):
         with self._lock:
@@ -148,13 +177,28 @@ class StockCache:
         with self._lock:
             return len(self._data)
 
+    def is_loaded(self):
+        return self._loaded
 
-def build_table(results, scanned, total, mode="scan", tick_count=0):
+    def get_last_scan(self):
+        return self._last_scan
+
+
+def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=None):
     paused_str = "[bold yellow]PAUSED[/bold yellow]" if paused.is_set() else "[bold green]LIVE[/bold green]"
+    
+    cache_str = ""
+    if cache_info:
+        loaded, last = cache_info
+        if loaded and last:
+            cache_str = f" | Cache: {last[:16]}"
+        else:
+            cache_str = " | Cache: Fresh"
+    
     title = (
         f"[{mode.upper()}] Top {TOP_N} | {MIN_CHANGE_PCT}%+ | "
-        f"{scanned}/{total} | Cache:{len(results)} | "
-        f"Ticks:{tick_count} | {paused_str}"
+        f"{scanned}/{total} | Ticks:{tick_count} | "
+        f"{paused_str}{cache_str}"
     )
 
     t = Table(title=title, expand=True)
@@ -197,7 +241,8 @@ def run_scanner(symbols, cache):
 
     def layout(mode="scan"):
         top = cache.top_n(TOP_N)
-        tbl = build_table(top, scanned, len(symbols), mode, tick_count)
+        cache_info = (cache.is_loaded(), cache.get_last_scan())
+        tbl = build_table(top, scanned, len(symbols), mode, tick_count, cache_info)
         lo = Layout()
         lo.split_column(
             Layout(Panel(prog, title=f"[{mode.upper()}]"), size=5),
@@ -228,6 +273,8 @@ def run_scanner(symbols, cache):
                                 description=f"CLI: {scanned}/{len(symbols)}")
             time.sleep(0.2)
 
+        prog.update(tid, description="[bold green]Scan done. Saving cache...[/bold green]")
+        cache.save()
         prog.update(tid, description="[bold green]Scan done. Tick-by-tick...[/bold green]")
 
         # Phase 2: Tick-by-tick for top stocks
@@ -253,6 +300,8 @@ def run_scanner(symbols, cache):
                             tick_count += 1
                         prev_prices[sym] = new_price
                     cache.update(results)
+                    if tick_count % 10 == 0:
+                        cache.save()
             except Exception:
                 pass
 
