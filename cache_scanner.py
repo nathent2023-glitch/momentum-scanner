@@ -24,10 +24,10 @@ MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
-BATCH_SIZE = 50
+BATCH_SIZE = 20
 CACHE_FILE = "scanner_cache.json"
 HTTP_TIMEOUT = 20
-BATCH_DELAY = 0.5
+BATCH_DELAY = 1.0
 
 stop_event = threading.Event()
 
@@ -46,7 +46,7 @@ def load_symbols(file_path):
         return [line.strip().upper() for line in f if line.strip()]
 
 
-def fetch_batch(symbols, retry=4):
+def fetch_batch(symbols, retry=5):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
         try:
@@ -60,7 +60,7 @@ def fetch_batch(symbols, retry=4):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        wait = 5 * (attempt + 1)
+                        wait = 8 * (attempt + 1)
                         time.sleep(wait)
                         continue
                     return [], True
@@ -68,7 +68,7 @@ def fetch_batch(symbols, retry=4):
                     return data, False
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(5)
+                time.sleep(8)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -205,11 +205,11 @@ def main():
         # Retry failed with longer delays
         if failed_batches and not stop_event.is_set():
             live.update(Panel(f"[yellow]Retrying {len(failed_batches)} failed batches...[/yellow]", title="Caching"))
-            time.sleep(15)
+            time.sleep(30)
             for i, batch in enumerate(failed_batches):
                 if stop_event.is_set():
                     break
-                raw, _ = fetch_batch(batch, retry=5)
+                raw, _ = fetch_batch(batch, retry=6)
                 parsed = parse_results(raw)
                 if parsed:
                     cache.update(parsed)
@@ -217,7 +217,7 @@ def main():
                     f"[yellow]Retry {i+1}/{len(failed_batches)} | Cache: {cache.count()}[/yellow]",
                     title="Retrying"
                 ))
-                time.sleep(2)
+                time.sleep(3)
 
     count = cache.count()
     if count > 0:
