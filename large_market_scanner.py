@@ -28,11 +28,11 @@ MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
 BATCH_SIZE = 100
 TOP_N = 20
-WORKERS = 6
+WORKERS = 4
 REFRESH_INTERVAL = 15
-TICK_INTERVAL = 1
+TICK_INTERVAL = 2
 CACHE_MAX = 1000
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 15
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -70,7 +70,7 @@ def load_symbols(file_path):
 
 def fetch_batch(symbols):
     sym_str = ",".join(symbols)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             result = subprocess.run(
                 [WEBULL_PATH, "data", "stock", "snapshot",
@@ -80,11 +80,14 @@ def fetch_batch(symbols):
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
+                if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
+                    time.sleep(2 * (attempt + 1))
+                    continue
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
             if attempt == 0:
-                time.sleep(0.5)
+                time.sleep(1)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -223,7 +226,7 @@ def run_scanner(symbols, cache):
                     scanned += len(futs[f])
                     prog.update(tid, advance=len(futs[f]),
                                 description=f"CLI: {scanned}/{len(symbols)}")
-            time.sleep(0.05)
+            time.sleep(0.2)
 
         prog.update(tid, description="[bold green]Scan done. Tick-by-tick...[/bold green]")
 
