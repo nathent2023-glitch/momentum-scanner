@@ -1,6 +1,6 @@
 """
-Momentum Scanner - Uses pre-built cache for fast updates
-Run cache_scanner.py first to build the cache
+Momentum Scanner - Direct CLI scanner, no pre-caching needed
+Uses SEC Edgar database for ticker list, Webull CLI for live prices
 """
 import os
 import sys
@@ -9,9 +9,9 @@ import time
 import subprocess
 import threading
 import signal
+import sqlite3
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
 
 from rich.console import Console
 from rich.layout import Layout
@@ -30,9 +30,11 @@ MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 TOP_N = 20
-WORKERS = 2
-CACHE_FILE = "scanner_cache.json"
-HTTP_TIMEOUT = 15
+WORKERS = 1
+BATCH_SIZE = 20
+STOCK_DB = "stock_cache.db"
+HTTP_TIMEOUT = 20
+BATCH_DELAY = 1.0
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -61,7 +63,20 @@ def key_listener():
         time.sleep(0.05)
 
 
-def fetch_batch(symbols, retry=3):
+def load_symbols_from_db():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join(script_dir, STOCK_DB)
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT ticker FROM stocks WHERE length(ticker) <= 5")
+    symbols = [r[0].upper() for r in c.fetchall()]
+    conn.close()
+    return symbols
+
+
+def fetch_batch(symbols, retry=5):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
         try:
@@ -75,14 +90,14 @@ def fetch_batch(symbols, retry=3):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        time.sleep(5 * (attempt + 1))
+                        time.sleep(8 * (attempt + 1))
                         continue
                     return []
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(3)
+                time.sleep(8)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -124,46 +139,14 @@ def parse_results(raw):
 
 
 class StockCache:
-    def __init__(self, cache_file=CACHE_FILE):
-        self._data = OrderedDict()
+    def __init__(self):
+        self._data = {}
         self._lock = threading.Lock()
-        self._cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_file)
-        self._loaded = False
-        self._last_scan = None
-
-    def load(self):
-        if os.path.exists(self._cache_file):
-            try:
-                with open(self._cache_file, "r") as f:
-                    saved = json.load(f)
-                self._data = OrderedDict()
-                for item in saved.get("data", []):
-                    self._data[item["symbol"]] = item
-                self._last_scan = saved.get("timestamp")
-                self._loaded = True
-                return True
-            except Exception:
-                pass
-        return False
-
-    def save(self):
-        try:
-            data = {
-                "timestamp": datetime.now().isoformat(),
-                "count": len(self._data),
-                "data": list(self._data.values()),
-            }
-            with open(self._cache_file, "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
 
     def update(self, results):
         with self._lock:
             for r in results:
-                s = r["symbol"]
-                self._data[s] = r
-                self._data.move_to_end(s)
+                self._data[r["symbol"]] = r
 
     def top_n(self, n=TOP_N):
         with self._lock:
@@ -174,33 +157,10 @@ class StockCache:
         with self._lock:
             return len(self._data)
 
-    def is_loaded(self):
-        return self._loaded
 
-    def get_last_scan(self):
-        return self._last_scan
-
-
-def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=None):
+def build_table(results, scanned, total, mode="scan", tick_count=0, cache_count=0):
     paused_str = "[bold yellow]PAUSED[/bold yellow]" if paused.is_set() else "[bold green]LIVE[/bold green]"
-    
-    cache_str = ""
-    if cache_info:
-        loaded, last, count = cache_info
-        pct = (count / total * 100) if total > 0 else 0
-        bar_len = 20
-        filled = int(bar_len * count / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_len - filled)
-        if loaded and last:
-            cache_str = f" | Cache: {count}/{total} {bar} {pct:.0f}%"
-        else:
-            cache_str = f" | Cache: {count}/{total} {bar} {pct:.0f}%"
-    
-    title = (
-        f"[{mode.upper()}] Top {TOP_N} | {MIN_CHANGE_PCT}%+ | "
-        f"{scanned}/{total} | Ticks:{tick_count} | "
-        f"{paused_str}{cache_str}"
-    )
+    title = f"[{mode.upper()}] Top {TOP_N} | {MIN_CHANGE_PCT}%+ | {scanned}/{total} | Cache: {cache_count} | Ticks:{tick_count} | {paused_str}"
 
     t = Table(title=title, expand=True)
     t.add_column("#", style="dim", width=4, justify="center")
@@ -228,10 +188,12 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=N
     return t
 
 
-def run_scanner(cache, total_symbols):
+def run_scanner(symbols, total):
     console = Console()
+    cache = StockCache()
     tick_count = 0
     prev_prices = {}
+    batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
 
     prog = Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -239,12 +201,11 @@ def run_scanner(cache, total_symbols):
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeRemainingColumn(),
     )
-    tid = prog.add_task("Starting...", total=total_symbols)
+    tid = prog.add_task("Starting...", total=total)
 
     def layout(mode="scan"):
         top = cache.top_n(TOP_N)
-        cache_info = (cache.is_loaded(), cache.get_last_scan(), cache.count())
-        tbl = build_table(top, cache.count(), total_symbols, mode, tick_count, cache_info)
+        tbl = build_table(top, cache.count(), total, mode, tick_count, cache.count())
         lo = Layout()
         lo.split_column(
             Layout(Panel(prog, title=f"[{mode.upper()}]"), size=5),
@@ -253,7 +214,36 @@ def run_scanner(cache, total_symbols):
         return lo
 
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Quick refresh: top 20 stocks every 3 seconds
+        # Full scan on startup
+        scanned = 0
+        for i, batch in enumerate(batches):
+            if stop_event.is_set():
+                break
+            if paused.is_set():
+                while paused.is_set():
+                    live.update(layout())
+                    time.sleep(0.2)
+
+            raw = fetch_batch(batch)
+            results = parse_results(raw)
+            if results:
+                for r in results:
+                    sym = r["symbol"]
+                    new_price = r["price"]
+                    old_price = prev_prices.get(sym)
+                    if old_price is not None and new_price != old_price:
+                        tick_count += 1
+                    prev_prices[sym] = new_price
+                cache.update(results)
+            scanned += len(batch)
+            pct = (scanned / total * 100) if total > 0 else 0
+            filled = int(20 * scanned / total) if total > 0 else 0
+            bar = "█" * filled + "░" * (20 - filled)
+            prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
+            live.update(layout("scan"))
+            time.sleep(BATCH_DELAY)
+
+        # Quick refresh loop: top 20 every 3s
         while not stop_event.is_set():
             if paused.is_set():
                 while paused.is_set():
@@ -263,7 +253,6 @@ def run_scanner(cache, total_symbols):
 
             top = cache.top_n(TOP_N)
             top_syms = [r["symbol"] for r in top]
-
             if top_syms:
                 try:
                     raw = fetch_batch(top_syms)
@@ -277,13 +266,10 @@ def run_scanner(cache, total_symbols):
                                 tick_count += 1
                             prev_prices[sym] = new_price
                         cache.update(results)
-                        if tick_count % 10 == 0:
-                            cache.save()
                 except Exception:
                     pass
 
             live.update(layout("tick"))
-            
             for _ in range(30):
                 if stop_event.is_set():
                     break
@@ -292,29 +278,12 @@ def run_scanner(cache, total_symbols):
 
 def main():
     console = Console()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    txt_path = os.path.join(script_dir, "master_list.txt")
-
-    if not os.path.exists(txt_path):
-        console.print(f"[red]No master_list.txt found[/red]")
+    symbols = load_symbols_from_db()
+    if not symbols:
+        console.print("[red]No symbols found in stock_cache.db[/red]")
         sys.exit(1)
 
-    with open(txt_path, "r") as f:
-        total_symbols = len([line for line in f if line.strip()])
-
-    cache = StockCache()
-    
-    if not cache.load():
-        console.print("[red]No cache found! Run cache_scanner.py first.[/red]")
-        console.print("[yellow]Command: python cache_scanner.py[/yellow]")
-        sys.exit(1)
-
-    cache_count = cache.count()
-    last_scan = cache.get_last_scan()
-    
-    console.print(f"[bold green]Momentum Scanner[/bold green] | "
-                  f"{cache_count} cached | {total_symbols} total | "
-                  f"Last: {last_scan[:16] if last_scan else 'Never'}")
+    console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols loaded")
     console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+[/dim]")
     console.print(f"[bold yellow]SPACE pause | T stop[/bold yellow]")
 
@@ -322,7 +291,7 @@ def main():
 
     while True:
         try:
-            run_scanner(cache, total_symbols)
+            run_scanner(symbols, len(symbols))
         except KeyboardInterrupt:
             stop_event.set()
             console.print("\n[bold red]Stopped.[/bold red]")
