@@ -189,11 +189,15 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=N
     
     cache_str = ""
     if cache_info:
-        loaded, last = cache_info
+        loaded, last, count = cache_info
+        pct = (count / total * 100) if total > 0 else 0
+        bar_len = 20
+        filled = int(bar_len * count / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
         if loaded and last:
-            cache_str = f" | Cache: {last[:16]}"
+            cache_str = f" | Cache: {count}/{total} {bar} {pct:.0f}%"
         else:
-            cache_str = " | Cache: Fresh"
+            cache_str = f" | Cache: {count}/{total} {bar} {pct:.0f}%"
     
     title = (
         f"[{mode.upper()}] Top {TOP_N} | {MIN_CHANGE_PCT}%+ | "
@@ -241,7 +245,7 @@ def run_scanner(symbols, cache):
 
     def layout(mode="scan"):
         top = cache.top_n(TOP_N)
-        cache_info = (cache.is_loaded(), cache.get_last_scan())
+        cache_info = (cache.is_loaded(), cache.get_last_scan(), cache.count())
         tbl = build_table(top, scanned, len(symbols), mode, tick_count, cache_info)
         lo = Layout()
         lo.split_column(
