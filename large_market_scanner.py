@@ -237,7 +237,8 @@ def run_scanner(symbols, total):
             live.update(layout("scan"))
             time.sleep(1.5)
 
-        # Phase 2: Full rescan every 15 seconds
+        # Phase 2: Live updates - top stocks every 2s, full rescan every 15s
+        last_full_rescan = time.time()
         while not stop_event.is_set():
             if paused.is_set():
                 while paused.is_set():
@@ -245,32 +246,55 @@ def run_scanner(symbols, total):
                     time.sleep(0.2)
                 continue
 
-            # Full rescan - all symbols
-            for i in range(0, len(batches), 2):
-                if stop_event.is_set() or paused.is_set():
-                    break
-                group = batches[i:i+2]
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    futs = {ex.submit(fetch_batch, b): b for b in group}
-                    for f in as_completed(futs):
-                        try:
-                            raw = f.result()
-                            results = parse_results(raw)
-                            if results:
-                                for r in results:
-                                    sym = r["symbol"]
-                                    new_price = r["price"]
-                                    old_price = prev_prices.get(sym)
-                                    if old_price is not None and new_price != old_price:
-                                        tick_count += 1
-                                    prev_prices[sym] = new_price
-                                cache.update(results)
-                        except Exception:
-                            pass
-                live.update(layout("rescan"))
+            # Quick refresh top 20 every 2 seconds
+            top = cache.top_n(TOP_N)
+            top_syms = [r["symbol"] for r in top]
+            if top_syms:
+                try:
+                    raw = fetch_batch(top_syms)
+                    results = parse_results(raw)
+                    if results:
+                        for r in results:
+                            sym = r["symbol"]
+                            new_price = r["price"]
+                            old_price = prev_prices.get(sym)
+                            if old_price is not None and new_price != old_price:
+                                tick_count += 1
+                            prev_prices[sym] = new_price
+                        cache.update(results)
+                except Exception:
+                    pass
 
-            # Wait 15 seconds before next rescan
-            for _ in range(150):
+            live.update(layout("tick"))
+
+            # Full rescan every 15 seconds
+            if time.time() - last_full_rescan >= 15:
+                last_full_rescan = time.time()
+                for i in range(0, len(batches), 2):
+                    if stop_event.is_set() or paused.is_set():
+                        break
+                    group = batches[i:i+2]
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        futs = {ex.submit(fetch_batch, b): b for b in group}
+                        for f in as_completed(futs):
+                            try:
+                                raw = f.result()
+                                results = parse_results(raw)
+                                if results:
+                                    for r in results:
+                                        sym = r["symbol"]
+                                        new_price = r["price"]
+                                        old_price = prev_prices.get(sym)
+                                        if old_price is not None and new_price != old_price:
+                                            tick_count += 1
+                                        prev_prices[sym] = new_price
+                                    cache.update(results)
+                            except Exception:
+                                pass
+                    live.update(layout("rescan"))
+
+            # Wait 2 seconds before next top stock refresh
+            for _ in range(20):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)
