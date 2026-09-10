@@ -30,11 +30,12 @@ MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 BATCH_SIZE = 100
 TOP_N = 20
-WORKERS = 4
-REFRESH_INTERVAL = 15
+WORKERS = 3
+REFRESH_INTERVAL = 3
 TICK_INTERVAL = 2
-CACHE_MAX = 1000
+CACHE_MAX = 2000
 HTTP_TIMEOUT = 15
+BATCH_DELAY = 0.15
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -70,9 +71,9 @@ def load_symbols(file_path):
         return [line.strip().upper() for line in f if line.strip()]
 
 
-def fetch_batch(symbols):
+def fetch_batch(symbols, retry=2):
     sym_str = ",".join(symbols)
-    for attempt in range(3):
+    for attempt in range(retry + 1):
         try:
             result = subprocess.run(
                 [WEBULL_PATH, "data", "stock", "snapshot",
@@ -83,13 +84,15 @@ def fetch_batch(symbols):
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
-                    time.sleep(2 * (attempt + 1))
-                    continue
+                    if attempt < retry:
+                        time.sleep(3 * (attempt + 1))
+                        continue
+                    return []
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
-            if attempt == 0:
-                time.sleep(1)
+            if attempt < retry:
+                time.sleep(2)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -313,8 +316,10 @@ def run_scanner(symbols, cache):
         cache.save()
         time.sleep(1)
 
-        # Phase 2: Rescan every 3 seconds
+        # Phase 2: Smart refresh - top stocks every 3s, random subset every 30s
+        import random
         scan_count = 0
+        last_full = 0
         while not stop_event.is_set():
             scan_count += 1
 
@@ -324,38 +329,17 @@ def run_scanner(symbols, cache):
                     time.sleep(0.2)
                 continue
 
-            prog.update(tid, advance=0, description=f"[bold blue]Rescan #{scan_count}...[/bold blue]")
+            now = time.time()
             
-            failed_batches = []
-            batch_scanned = 0
-            for i in range(0, len(batches), WORKERS):
-                if stop_event.is_set():
-                    break
-                group = batches[i:i+WORKERS]
-                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                    futs = {ex.submit(fetch_batch, b): b for b in group}
-                    for f in as_completed(futs):
-                        try:
-                            raw = f.result()
-                            parsed = parse_results(raw)
-                            if parsed:
-                                cache.update(parsed)
-                            else:
-                                failed_batches.append(futs[f])
-                        except Exception:
-                            failed_batches.append(futs[f])
-                        batch_scanned += len(futs[f])
-                        prog.update(tid, advance=len(futs[f]),
-                                    description=f"[blue]Rescan #{scan_count}: {batch_scanned}/{len(symbols)}[/blue]")
-                time.sleep(0.2)
-
-            # Retry failed
-            if failed_batches:
-                time.sleep(3)
-                for i in range(0, len(failed_batches), WORKERS):
+            # Full rescan every 30 seconds
+            if now - last_full >= 30:
+                prog.update(tid, advance=0, description=f"[bold blue]Rescan #{scan_count}: Full[/bold blue]")
+                failed = []
+                batch_scanned = 0
+                for i in range(0, len(batches), WORKERS):
                     if stop_event.is_set():
                         break
-                    group = failed_batches[i:i+WORKERS]
+                    group = batches[i:i+WORKERS]
                     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                         futs = {ex.submit(fetch_batch, b): b for b in group}
                         for f in as_completed(futs):
@@ -364,14 +348,51 @@ def run_scanner(symbols, cache):
                                 parsed = parse_results(raw)
                                 if parsed:
                                     cache.update(parsed)
+                                else:
+                                    failed.append(futs[f])
                             except Exception:
-                                pass
-                    time.sleep(0.3)
+                                failed.append(futs[f])
+                            batch_scanned += len(futs[f])
+                            prog.update(tid, advance=len(futs[f]),
+                                        description=f"[blue]Rescan #{scan_count}: {batch_scanned}/{len(symbols)}[/blue]")
+                    time.sleep(BATCH_DELAY)
+                
+                if failed:
+                    time.sleep(3)
+                    for i in range(0, len(failed), WORKERS):
+                        if stop_event.is_set():
+                            break
+                        group = failed[i:i+WORKERS]
+                        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                            futs = {ex.submit(fetch_batch, b): b for b in group}
+                            for f in as_completed(futs):
+                                try:
+                                    raw = f.result()
+                                    parsed = parse_results(raw)
+                                    if parsed:
+                                        cache.update(parsed)
+                                except Exception:
+                                    pass
+                        time.sleep(0.3)
+                last_full = now
+            else:
+                # Quick refresh: top 20 stocks only
+                prog.update(tid, advance=0, description=f"[blue]Rescan #{scan_count}: Quick top[/bold blue]")
+                top = cache.top_n(TOP_N)
+                top_syms = [r["symbol"] for r in top]
+                if top_syms:
+                    try:
+                        raw = fetch_batch(top_syms)
+                        parsed = parse_results(raw)
+                        if parsed:
+                            cache.update(parsed)
+                    except Exception:
+                        pass
 
             cache.save()
             live.update(layout("scan"))
             
-            # Wait 3 seconds between rescans
+            # Wait 3 seconds between refreshes
             for _ in range(30):
                 if stop_event.is_set():
                     break
