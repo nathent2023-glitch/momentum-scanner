@@ -30,12 +30,12 @@ MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 BATCH_SIZE = 100
 TOP_N = 20
-WORKERS = 3
+WORKERS = 2
 REFRESH_INTERVAL = 3
 TICK_INTERVAL = 2
 CACHE_MAX = 2000
 HTTP_TIMEOUT = 15
-BATCH_DELAY = 0.15
+BATCH_DELAY = 0.3
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -71,7 +71,7 @@ def load_symbols(file_path):
         return [line.strip().upper() for line in f if line.strip()]
 
 
-def fetch_batch(symbols, retry=2):
+def fetch_batch(symbols, retry=3):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
         try:
@@ -85,14 +85,15 @@ def fetch_batch(symbols, retry=2):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        time.sleep(3 * (attempt + 1))
+                        wait = 5 * (attempt + 1)
+                        time.sleep(wait)
                         continue
                     return []
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(2)
+                time.sleep(3)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -267,7 +268,10 @@ def run_scanner(symbols, cache):
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
         # Phase 1: CLI scan with retry for failed batches
         failed_batches = []
+        rate_limited = False
         for i in range(0, len(batches), WORKERS):
+            if stop_event.is_set():
+                break
             if paused.is_set():
                 while paused.is_set():
                     live.update(layout())
@@ -283,19 +287,26 @@ def run_scanner(symbols, cache):
                         parsed = parse_results(raw)
                         if parsed:
                             cache.update(parsed)
+                            rate_limited = False
                         else:
                             failed_batches.append(futs[f])
+                            rate_limited = True
                     except Exception:
                         failed_batches.append(futs[f])
                     scanned += len(futs[f])
                     prog.update(tid, advance=len(futs[f]),
                                 description=f"CLI: {scanned}/{len(symbols)}")
-            time.sleep(0.2)
+            
+            # Longer delay if rate limited
+            if rate_limited:
+                time.sleep(2)
+            else:
+                time.sleep(BATCH_DELAY)
 
         # Retry failed batches
-        if failed_batches:
+        if failed_batches and not stop_event.is_set():
             prog.update(tid, description=f"Retrying {len(failed_batches)} failed batches...")
-            time.sleep(5)
+            time.sleep(10)
             for i in range(0, len(failed_batches), WORKERS):
                 if stop_event.is_set():
                     break
@@ -310,7 +321,7 @@ def run_scanner(symbols, cache):
                                 cache.update(parsed)
                         except Exception:
                             pass
-                time.sleep(0.5)
+                time.sleep(1)
 
         prog.update(tid, description=f"[bold green]Scan done. Cache: {cache.count()}/{len(symbols)}. Saving...[/bold green]")
         cache.save()
