@@ -172,27 +172,6 @@ def main():
     cache = StockCache()
     last_scan, cached_count = cache.load()
     
-    if last_scan:
-        console.print(f"[yellow]Found existing cache: {cached_count} stocks from {last_scan[:16]}[/yellow]")
-        console.print("[dim]Press R to rebuild, or wait 3s to use existing cache...[/dim]")
-        
-        for i in range(30):
-            if stop_event.is_set():
-                break
-            try:
-                import msvcrt
-                if msvcrt.kbhit():
-                    key = msvcrt.getch()
-                    if key == b"r":
-                        console.print("[yellow]Rebuilding cache...[/yellow]")
-                        break
-            except Exception:
-                pass
-            time.sleep(0.1)
-        else:
-            console.print("[green]Using existing cache. Starting scanner...[/green]")
-            return
-
     console.print(f"[bold green]Caching {len(symbols)} stocks...[/bold green]")
     console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+ change[/dim]")
 
