@@ -64,15 +64,6 @@ def key_listener():
 
 def load_symbols():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(script_dir, STOCK_DB)
-    if os.path.exists(db_path):
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute("SELECT ticker FROM stocks WHERE length(ticker) >= 1 AND length(ticker) <= 5")
-        symbols = [r[0].upper() for r in c.fetchall()]
-        conn.close()
-        if symbols:
-            return symbols
     txt_path = os.path.join(script_dir, "master_list.txt")
     if os.path.exists(txt_path):
         with open(txt_path, "r") as f:
