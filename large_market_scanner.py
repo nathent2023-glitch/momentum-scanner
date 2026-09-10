@@ -1,6 +1,5 @@
 """
-Momentum Scanner - Fast stock momentum detection
-Hybrid CLI + HTTP API scanning with caching
+Momentum Scanner - CLI scan + tick-by-tick for top movers
 """
 import os
 import sys
@@ -9,6 +8,7 @@ import time
 import subprocess
 import threading
 import re
+import signal
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
@@ -39,6 +39,13 @@ paused = threading.Event()
 stop_event = threading.Event()
 
 
+def signal_handler(sig, frame):
+    stop_event.set()
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
 def key_listener():
     import msvcrt
     while not stop_event.is_set():
@@ -49,6 +56,8 @@ def key_listener():
                     paused.clear()
                 else:
                     paused.set()
+            elif key == b"t":
+                stop_event.set()
         time.sleep(0.05)
 
 
@@ -70,6 +79,7 @@ def fetch_batch_cli(symbols):
                 [WEBULL_PATH, "data", "stock", "snapshot",
                  "--symbol", sym_str, "--extend-hour", "--overnight"],
                 capture_output=True, text=True, timeout=HTTP_TIMEOUT,
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
@@ -85,17 +95,49 @@ def fetch_batch_cli(symbols):
     return []
 
 
+def parse_results(raw):
+    out = []
+    for item in raw:
+        try:
+            price = float(item.get("price", 0))
+            pre = float(item.get("pre_close", 0))
+            vol = int(item.get("volume", 0))
+            sym = item.get("symbol", "")
+            pct = float(item.get("change_ratio", 0)) * 100
+            ep = item.get("extend_hour_last_price")
+            ec = item.get("extend_hour_change_ratio")
+            ev = item.get("extend_hour_volume")
+            op = item.get("ovn_price")
+            oc = item.get("ovn_change_ratio")
+            ov = item.get("ovn_volume")
+            if price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
+                out.append({
+                    "symbol": sym, "price": price, "prev_close": pre,
+                    "change_pct": pct, "volume": vol,
+                    "ext_price": float(ep) if ep else None,
+                    "ext_change_pct": float(ec) * 100 if ec else None,
+                    "ext_vol": int(ev) if ev else None,
+                    "ovn_price": float(op) if op else None,
+                    "ovn_change_pct": float(oc) * 100 if oc else None,
+                    "ovn_vol": int(ov) if ov else None,
+                })
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 # ==========================================
-# HTTP FETCHER (background thread)
+# TICK-BY-TICK FETCHER
 # ==========================================
-class HTTPFetcher:
+class TickFetcher:
     def __init__(self):
         self._page = None
         self._pw = None
         self._browser = None
         self._ready = False
-        self._ticker_cache = {}
+        self._ticker_ids = {}
         self._lock = threading.Lock()
+        self._top_symbols = []
 
     def start(self):
         try:
@@ -113,41 +155,56 @@ class HTTPFetcher:
     def stop(self):
         self._ready = False
         try:
+            if self._page:
+                self._page.close()
+        except Exception:
+            pass
+        try:
             if self._browser:
                 self._browser.close()
+        except Exception:
+            pass
+        try:
             if self._pw:
                 self._pw.stop()
         except Exception:
             pass
 
-    def get_ticker_id(self, symbol):
-        if symbol in self._ticker_cache:
-            return self._ticker_cache[symbol]
-        try:
-            self._page.goto(f"https://app.webull.com/stocks/{symbol}", timeout=10000)
-            self._page.wait_for_timeout(1500)
-            content = self._page.content()
-            match = re.search(r'tickerId[=:](\d+)', content)
-            if match:
-                tid = match.group(1)
-                with self._lock:
-                    self._ticker_cache[symbol] = tid
-                return tid
-        except Exception:
-            pass
-        return None
-
-    def fetch_batch(self, symbols):
+    def get_ticker_ids(self, symbols):
         if not self._ready:
+            return {}
+        new_syms = [s for s in symbols if s not in self._ticker_ids]
+        if not new_syms:
+            return {s: self._ticker_ids[s] for s in symbols if s in self._ticker_ids}
+
+        for sym in new_syms:
+            captured = []
+            def on_req(req):
+                if 'getQuote' in req.url and 'tickerId=' in req.url:
+                    m = re.search(r'tickerId=(\d+)', req.url)
+                    if m:
+                        captured.append(m.group(1))
+
+            self._page.on("request", on_req)
+            try:
+                self._page.goto(f"https://app.webull.com/stocks/{sym}", timeout=10000)
+                self._page.wait_for_timeout(1500)
+                if captured:
+                    with self._lock:
+                        self._ticker_ids[sym] = captured[0]
+            except Exception:
+                pass
+            self._page.remove_listener("request", on_req)
+
+        return {s: self._ticker_ids[s] for s in symbols if s in self._ticker_ids}
+
+    def fetch_tick(self, symbols):
+        if not self._ready or not symbols:
             return []
-        ids = []
-        for sym in symbols[:TOP_N]:
-            tid = self.get_ticker_id(sym)
-            if tid:
-                ids.append((sym, tid))
+        ids = self.get_ticker_ids(symbols)
         if not ids:
             return []
-        csv = ",".join(t for _, t in ids)
+        csv = ",".join(ids.values())
         try:
             data = self._page.evaluate(f"""
                 async () => {{
@@ -158,7 +215,7 @@ class HTTPFetcher:
                     return await r.json();
                 }}
             """)
-            return self._parse(data, {t: s for s, t in ids})
+            return self._parse(data, ids)
         except Exception:
             return []
 
@@ -166,16 +223,17 @@ class HTTPFetcher:
         if not isinstance(data, list):
             return []
         out = []
+        id_to_sym = {v: k for k, v in id_map.items()}
         for item in data:
             try:
                 tid = str(item.get("tickerId", ""))
-                sym = id_map.get(tid, item.get("symbol", ""))
+                sym = id_to_sym.get(tid, item.get("symbol", ""))
                 close = float(item.get("close", 0))
                 pre = float(item.get("preClose", 0))
                 cr = float(item.get("changeRatio", 0))
                 vol = int(item.get("volume", 0))
                 pct = cr * 100
-                if close >= MIN_PRICE and close <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
+                if close >= MIN_PRICE and close <= MAX_PRICE and pre > 0:
                     out.append({
                         "symbol": sym, "price": close, "prev_close": pre,
                         "change_pct": pct, "volume": vol,
@@ -216,48 +274,14 @@ class StockCache:
 
 
 # ==========================================
-# PARSE CLI
-# ==========================================
-def parse_results(raw):
-    out = []
-    for item in raw:
-        try:
-            price = float(item.get("price", 0))
-            pre = float(item.get("pre_close", 0))
-            vol = int(item.get("volume", 0))
-            sym = item.get("symbol", "")
-            pct = float(item.get("change_ratio", 0)) * 100
-            ep = item.get("extend_hour_last_price")
-            ec = item.get("extend_hour_change_ratio")
-            ev = item.get("extend_hour_volume")
-            op = item.get("ovn_price")
-            oc = item.get("ovn_change_ratio")
-            ov = item.get("ovn_volume")
-            if price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
-                out.append({
-                    "symbol": sym, "price": price, "prev_close": pre,
-                    "change_pct": pct, "volume": vol,
-                    "ext_price": float(ep) if ep else None,
-                    "ext_change_pct": float(ec) * 100 if ec else None,
-                    "ext_vol": int(ev) if ev else None,
-                    "ovn_price": float(op) if op else None,
-                    "ovn_change_pct": float(oc) * 100 if oc else None,
-                    "ovn_vol": int(ov) if ov else None,
-                })
-        except (ValueError, TypeError):
-            continue
-    return out
-
-
-# ==========================================
 # TABLE
 # ==========================================
-def build_table(results, scanned, total, countdown=None, src="cli"):
+def build_table(results, scanned, total, countdown=None, src="cli", tick_data=None, tick_count=0):
     paused_str = "[bold yellow]PAUSED[/bold yellow]" if paused.is_set() else "[bold green]LIVE[/bold green]"
     title = (
         f"Top {TOP_N} | {MIN_CHANGE_PCT}%+ | "
         f"{scanned}/{total} | Cache:{len(results)} | "
-        f"[dim]{src}[/dim] | {paused_str}"
+        f"[dim]{src}[/dim] | {paused_str} | Ticks:{tick_count}"
     )
     if paused.is_set():
         title += " | SPACE"
@@ -292,11 +316,14 @@ def build_table(results, scanned, total, countdown=None, src="cli"):
 # ==========================================
 def run_scanner(symbols, cache):
     console = Console()
-    http = HTTPFetcher()
-    threading.Thread(target=http.start, daemon=True).start()
+    tick_fetcher = TickFetcher()
+    threading.Thread(target=tick_fetcher.start, daemon=True).start()
 
     scanned = 0
     batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+    tick_count = 0
+    prev_prices = {}
+    mode = "scan"  # scan -> tick
 
     prog = Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -306,12 +333,12 @@ def run_scanner(symbols, cache):
     )
     tid = prog.add_task("Starting...", total=len(symbols))
 
-    def layout(cd=None, ts=None, src="cli"):
+    def layout(cd=None, ts=None, src="cli", mode_str="scan"):
         top = cache.top_n(TOP_N)
-        tbl = build_table(top, scanned, len(symbols), cd, src)
+        tbl = build_table(top, scanned, len(symbols), cd, src, tick_count=tick_count)
         lo = Layout()
         lo.split_column(
-            Layout(Panel(prog, title="Scan"), size=5),
+            Layout(Panel(prog, title=f"[{mode_str.upper()}]"), size=5),
             Layout(Panel(tbl, title="Results")),
         )
         return lo
@@ -339,33 +366,75 @@ def run_scanner(symbols, cache):
                                 description=f"CLI: {scanned}/{len(symbols)}")
             time.sleep(0.05)
 
-        prog.update(tid, description="[bold green]Done. HTTP refresh...[/bold green]")
+        prog.update(tid, description="[bold green]Scan done. Getting ticker IDs...[/bold green]")
+        live.update(layout(src="init", mode_str="tick"))
 
-        # Phase 2: HTTP refresh
-        for rem in range(REFRESH_INTERVAL, 0, -1):
+        # Phase 2: Get ticker IDs for top movers
+        top_syms = [r["symbol"] for r in cache.top_n(TOP_N)]
+        if tick_fetcher._ready and top_syms:
+            tick_fetcher.get_ticker_ids(top_syms)
+            prog.update(tid, description=f"[bold green]Got {len(tick_fetcher._ticker_ids)} ticker IDs. Tick-by-tick...[/bold green]")
+        else:
+            prog.update(tid, description="[bold yellow]HTTP not ready. Using CLI refresh...[/bold yellow]")
+
+        # Phase 3: Tick-by-tick
+        tick_idx = 0
+        while not stop_event.is_set():
             if paused.is_set():
                 while paused.is_set():
-                    live.update(layout())
+                    live.update(layout(mode_str="tick"))
                     time.sleep(0.2)
-                break
+                continue
 
-            if rem % LIVE_REFRESH == 0:
-                try:
-                    syms = [r["symbol"] for r in cache.top_n(TOP_N)]
-                    if syms and http._ready:
-                        res = http.fetch_batch(syms)
-                        if res:
-                            cache.update(res)
-                            live.update(layout(cd=rem, ts=datetime.now().strftime("%H:%M:%S"), src="http"))
-                            continue
-                except Exception:
-                    pass
-                live.update(layout(cd=rem, ts=datetime.now().strftime("%H:%M:%S"), src="cli"))
-            else:
-                live.update(layout(cd=rem, src="cli"))
+            top = cache.top_n(TOP_N)
+            top_syms = [r["symbol"] for r in top]
+
+            # Rotate through top stocks for ticker ID fetching (5 at a time)
+            batch = top_syms[tick_idx:tick_idx+5]
+            tick_idx = (tick_idx + 5) % len(top_syms) if top_syms else 0
+
+            # Fetch tick data
+            if tick_fetcher._ready and batch:
+                tick_data = tick_fetcher.fetch_tick(batch)
+                if tick_data:
+                    for td in tick_data:
+                        sym = td["symbol"]
+                        new_price = td["price"]
+                        old_price = prev_prices.get(sym)
+                        if old_price is not None and new_price != old_price:
+                            tick_count += 1
+                        prev_prices[sym] = new_price
+                    cache.update(tick_data)
+                    live.update(layout(src="tick", mode_str="tick"))
+                    time.sleep(0.5)
+                    continue
+
+            # Fallback: CLI refresh
+            try:
+                if top_syms:
+                    raw = fetch_batch_cli(top_syms[:10])
+                    results = parse_results(raw)
+                    if results:
+                        for r in results:
+                            sym = r["symbol"]
+                            new_price = r["price"]
+                            old_price = prev_prices.get(sym)
+                            if old_price is not None and new_price != old_price:
+                                tick_count += 1
+                            prev_prices[sym] = new_price
+                        cache.update(results)
+            except Exception:
+                pass
+
+            live.update(layout(src="cli", mode_str="tick"))
             time.sleep(1)
 
-    http.stop()
+    tick_fetcher.stop()
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
 
 
 # ==========================================
@@ -388,7 +457,7 @@ def main():
         f"{len(symbols)} symbols | "
         f"{MIN_CHANGE_PCT}%+ | "
         f"${MIN_PRICE}-${MAX_PRICE} | "
-        f"[bold yellow]SPACE pause[/bold yellow]"
+        f"[bold yellow]SPACE pause | T stop[/bold yellow]"
     )
 
     cache = StockCache()
@@ -397,7 +466,10 @@ def main():
             run_scanner(symbols, cache)
         except KeyboardInterrupt:
             stop_event.set()
-            console.print("\n[bold red]Stopped.[/bold red]")
+            try:
+                console.print("\n[bold red]Stopped.[/bold red]")
+            except Exception:
+                pass
             break
         except Exception as e:
             console.print(f"[bold red]Error: {e}. Retry 5s...[/bold red]")
