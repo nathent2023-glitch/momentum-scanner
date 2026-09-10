@@ -48,6 +48,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def key_listener():
     import msvcrt
+    global MIN_PRICE, MAX_PRICE, MIN_CHANGE_PCT, MIN_VOLUME, MIN_FLOAT
     while not stop_event.is_set():
         if msvcrt.kbhit():
             key = msvcrt.getch()
@@ -59,6 +60,27 @@ def key_listener():
             elif key == b"t":
                 stop_event.set()
                 break
+            elif key == b"f":
+                paused.set()
+                time.sleep(0.2)
+                print("\n--- FILTER MODE ---")
+                print(f"Current: Price ${MIN_PRICE}-${MAX_PRICE} | Change {MIN_CHANGE_PCT}%+ | Volume {MIN_VOLUME/1e6:.1f}M+ | Float {MIN_FLOAT/1e6:.1f}M+")
+                print("Press Enter to keep current value")
+                try:
+                    val = input(f"Min Price [{MIN_PRICE}]: ").strip()
+                    if val: MIN_PRICE = float(val)
+                    val = input(f"Max Price [{MAX_PRICE}]: ").strip()
+                    if val: MAX_PRICE = float(val)
+                    val = input(f"Min Change% [{MIN_CHANGE_PCT}]: ").strip()
+                    if val: MIN_CHANGE_PCT = float(val)
+                    val = input(f"Min Volume (M) [{MIN_VOLUME/1e6:.1f}]: ").strip()
+                    if val: MIN_VOLUME = float(val) * 1e6
+                    val = input(f"Min Float (M) [{MIN_FLOAT/1e6:.1f}]: ").strip()
+                    if val: MIN_FLOAT = float(val) * 1e6
+                    print(f"\nNew filters: Price ${MIN_PRICE}-${MAX_PRICE} | Change {MIN_CHANGE_PCT}%+ | Volume {MIN_VOLUME/1e6:.1f}M+ | Float {MIN_FLOAT/1e6:.1f}M+")
+                except Exception:
+                    print("Invalid input, keeping current filters")
+                paused.clear()
         time.sleep(0.05)
 
 
