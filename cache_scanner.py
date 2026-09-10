@@ -9,6 +9,7 @@ import time
 import subprocess
 import threading
 import signal
+import sqlite3
 from datetime import datetime
 
 from rich.console import Console
@@ -26,6 +27,7 @@ MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 BATCH_SIZE = 20
 CACHE_FILE = "scanner_cache.json"
+STOCK_DB = "stock_cache.db"
 HTTP_TIMEOUT = 20
 BATCH_DELAY = 1.0
 
@@ -39,11 +41,15 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
-def load_symbols(file_path):
-    if not os.path.exists(file_path):
+def load_symbols_from_db(db_path):
+    if not os.path.exists(db_path):
         return []
-    with open(file_path, "r") as f:
-        return [line.strip().upper() for line in f if line.strip()]
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT ticker FROM stocks WHERE length(ticker) <= 5")
+    symbols = [r[0].upper() for r in c.fetchall()]
+    conn.close()
+    return symbols
 
 
 def fetch_batch(symbols, retry=5):
@@ -157,11 +163,11 @@ class StockCache:
 def main():
     console = Console()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    txt_path = os.path.join(script_dir, "master_list.txt")
+    db_path = os.path.join(script_dir, STOCK_DB)
 
-    symbols = load_symbols(txt_path)
+    symbols = load_symbols_from_db(db_path)
     if not symbols:
-        console.print(f"[red]No symbols in {txt_path}[/red]")
+        console.print(f"[red]No symbols in {db_path}[/red]")
         sys.exit(1)
 
     cache = StockCache()
