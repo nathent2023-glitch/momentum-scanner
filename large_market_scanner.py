@@ -30,11 +30,11 @@ MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
 TOP_N = 20
-WORKERS = 1
-BATCH_SIZE = 20
+WORKERS = 2
+BATCH_SIZE = 50
 STOCK_DB = "stock_cache.db"
 HTTP_TIMEOUT = 20
-BATCH_DELAY = 1.0
+BATCH_DELAY = 0.3
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -76,7 +76,7 @@ def load_symbols_from_db():
     return symbols
 
 
-def fetch_batch(symbols, retry=5):
+def fetch_batch(symbols, retry=3):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
         try:
@@ -90,14 +90,14 @@ def fetch_batch(symbols, retry=5):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        time.sleep(8 * (attempt + 1))
+                        time.sleep(3 * (attempt + 1))
                         continue
                     return []
                 if isinstance(data, list):
                     return data
         except subprocess.TimeoutExpired:
             if attempt < retry:
-                time.sleep(8)
+                time.sleep(3)
                 continue
         except (json.JSONDecodeError, Exception):
             pass
@@ -214,9 +214,10 @@ def run_scanner(symbols, total):
         return lo
 
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Full scan on startup
+        # Full scan on startup - parallel batches
         scanned = 0
-        for i, batch in enumerate(batches):
+        failed = []
+        for i in range(0, len(batches), WORKERS):
             if stop_event.is_set():
                 break
             if paused.is_set():
@@ -224,23 +225,29 @@ def run_scanner(symbols, total):
                     live.update(layout())
                     time.sleep(0.2)
 
-            raw = fetch_batch(batch)
-            results = parse_results(raw)
-            if results:
-                for r in results:
-                    sym = r["symbol"]
-                    new_price = r["price"]
-                    old_price = prev_prices.get(sym)
-                    if old_price is not None and new_price != old_price:
-                        tick_count += 1
-                    prev_prices[sym] = new_price
-                cache.update(results)
-            scanned += len(batch)
-            pct = (scanned / total * 100) if total > 0 else 0
-            filled = int(20 * scanned / total) if total > 0 else 0
-            bar = "█" * filled + "░" * (20 - filled)
-            prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
-            live.update(layout("scan"))
+            group = batches[i:i+WORKERS]
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                futs = {ex.submit(fetch_batch, b): b for b in group}
+                for f in as_completed(futs):
+                    try:
+                        raw = f.result()
+                        results = parse_results(raw)
+                        if results:
+                            for r in results:
+                                sym = r["symbol"]
+                                new_price = r["price"]
+                                old_price = prev_prices.get(sym)
+                                if old_price is not None and new_price != old_price:
+                                    tick_count += 1
+                                prev_prices[sym] = new_price
+                            cache.update(results)
+                    except Exception:
+                        failed.append(futs[f])
+                    scanned += len(futs[f])
+                    pct = (scanned / total * 100) if total > 0 else 0
+                    filled = int(20 * scanned / total) if total > 0 else 0
+                    bar = "█" * filled + "░" * (20 - filled)
+                    prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
             time.sleep(BATCH_DELAY)
 
         # Quick refresh loop: top 20 every 3s
