@@ -1,5 +1,6 @@
 """
-Momentum Scanner - CLI only, tick-by-tick for top movers
+Momentum Scanner - Uses pre-built cache for fast updates
+Run cache_scanner.py first to build the cache
 """
 import os
 import sys
@@ -28,14 +29,10 @@ MAX_PRICE = 2000.00
 MIN_CHANGE_PCT = 2.0
 MIN_VOLUME = 1_000_000
 MIN_FLOAT = 2_000_000
-BATCH_SIZE = 100
 TOP_N = 20
 WORKERS = 2
-REFRESH_INTERVAL = 3
-TICK_INTERVAL = 2
-CACHE_MAX = 2000
+CACHE_FILE = "scanner_cache.json"
 HTTP_TIMEOUT = 15
-BATCH_DELAY = 0.3
 
 paused = threading.Event()
 stop_event = threading.Event()
@@ -64,13 +61,6 @@ def key_listener():
         time.sleep(0.05)
 
 
-def load_symbols(file_path):
-    if not os.path.exists(file_path):
-        return []
-    with open(file_path, "r") as f:
-        return [line.strip().upper() for line in f if line.strip()]
-
-
 def fetch_batch(symbols, retry=3):
     sym_str = ",".join(symbols)
     for attempt in range(retry + 1):
@@ -85,8 +75,7 @@ def fetch_batch(symbols, retry=3):
                 data = json.loads(result.stdout)
                 if isinstance(data, dict) and data.get("error_code") == "TOO_MANY_REQUESTS":
                     if attempt < retry:
-                        wait = 5 * (attempt + 1)
-                        time.sleep(wait)
+                        time.sleep(5 * (attempt + 1))
                         continue
                     return []
                 if isinstance(data, list):
@@ -111,6 +100,7 @@ def parse_results(raw):
             sym = item.get("symbol", "")
             pct = float(item.get("change_ratio", 0)) * 100
             fp = float(item.get("out_standing_shares", 0)) if item.get("out_standing_shares") else 0
+            inst_id = item.get("instrument_id", "")
             ep = item.get("extend_hour_last_price")
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
@@ -118,7 +108,8 @@ def parse_results(raw):
             if (price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT 
                 and pre > 0 and vol >= MIN_VOLUME and fp >= MIN_FLOAT):
                 out.append({
-                    "symbol": sym, "price": price, "prev_close": pre,
+                    "symbol": sym, "instrument_id": inst_id,
+                    "price": price, "prev_close": pre,
                     "change_pct": pct, "volume": vol, "float": fp,
                     "ext_price": float(ep) if ep else None,
                     "ext_change_pct": float(ec) * 100 if ec else None,
@@ -133,14 +124,12 @@ def parse_results(raw):
 
 
 class StockCache:
-    def __init__(self, max_size=CACHE_MAX, cache_file="scanner_cache.json"):
+    def __init__(self, cache_file=CACHE_FILE):
         self._data = OrderedDict()
-        self._max = max_size
         self._lock = threading.Lock()
         self._cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_file)
         self._loaded = False
         self._last_scan = None
-        self.load()
 
     def load(self):
         if os.path.exists(self._cache_file):
@@ -152,8 +141,10 @@ class StockCache:
                     self._data[item["symbol"]] = item
                 self._last_scan = saved.get("timestamp")
                 self._loaded = True
+                return True
             except Exception:
-                self._loaded = False
+                pass
+        return False
 
     def save(self):
         try:
@@ -173,8 +164,6 @@ class StockCache:
                 s = r["symbol"]
                 self._data[s] = r
                 self._data.move_to_end(s)
-                while len(self._data) > self._max:
-                    self._data.popitem(last=False)
 
     def top_n(self, n=TOP_N):
         with self._lock:
@@ -239,10 +228,8 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_info=N
     return t
 
 
-def run_scanner(symbols, cache):
+def run_scanner(cache, total_symbols):
     console = Console()
-    scanned = 0
-    batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     tick_count = 0
     prev_prices = {}
 
@@ -252,12 +239,12 @@ def run_scanner(symbols, cache):
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeRemainingColumn(),
     )
-    tid = prog.add_task("Starting...", total=len(symbols))
+    tid = prog.add_task("Starting...", total=total_symbols)
 
     def layout(mode="scan"):
         top = cache.top_n(TOP_N)
         cache_info = (cache.is_loaded(), cache.get_last_scan(), cache.count())
-        tbl = build_table(top, scanned, len(symbols), mode, tick_count, cache_info)
+        tbl = build_table(top, cache.count(), total_symbols, mode, tick_count, cache_info)
         lo = Layout()
         lo.split_column(
             Layout(Panel(prog, title=f"[{mode.upper()}]"), size=5),
@@ -266,144 +253,37 @@ def run_scanner(symbols, cache):
         return lo
 
     with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Phase 1: CLI scan with retry for failed batches
-        failed_batches = []
-        rate_limited = False
-        for i in range(0, len(batches), WORKERS):
-            if stop_event.is_set():
-                break
+        # Quick refresh: top 20 stocks every 3 seconds
+        while not stop_event.is_set():
             if paused.is_set():
                 while paused.is_set():
                     live.update(layout())
                     time.sleep(0.2)
-                prog.update(tid, description="Resuming...")
-
-            group = batches[i:i+WORKERS]
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                futs = {ex.submit(fetch_batch, b): b for b in group}
-                for f in as_completed(futs):
-                    try:
-                        raw = f.result()
-                        parsed = parse_results(raw)
-                        if parsed:
-                            cache.update(parsed)
-                            rate_limited = False
-                        else:
-                            failed_batches.append(futs[f])
-                            rate_limited = True
-                    except Exception:
-                        failed_batches.append(futs[f])
-                    scanned += len(futs[f])
-                    prog.update(tid, advance=len(futs[f]),
-                                description=f"CLI: {scanned}/{len(symbols)}")
-            
-            # Longer delay if rate limited
-            if rate_limited:
-                time.sleep(2)
-            else:
-                time.sleep(BATCH_DELAY)
-
-        # Retry failed batches
-        if failed_batches and not stop_event.is_set():
-            prog.update(tid, description=f"Retrying {len(failed_batches)} failed batches...")
-            time.sleep(10)
-            for i in range(0, len(failed_batches), WORKERS):
-                if stop_event.is_set():
-                    break
-                group = failed_batches[i:i+WORKERS]
-                with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                    futs = {ex.submit(fetch_batch, b): b for b in group}
-                    for f in as_completed(futs):
-                        try:
-                            raw = f.result()
-                            parsed = parse_results(raw)
-                            if parsed:
-                                cache.update(parsed)
-                        except Exception:
-                            pass
-                time.sleep(1)
-
-        prog.update(tid, description=f"[bold green]Scan done. Cache: {cache.count()}/{len(symbols)}. Saving...[/bold green]")
-        cache.save()
-        time.sleep(1)
-
-        # Phase 2: Smart refresh - top stocks every 3s, random subset every 30s
-        import random
-        scan_count = 0
-        last_full = 0
-        while not stop_event.is_set():
-            scan_count += 1
-
-            if paused.is_set():
-                while paused.is_set():
-                    live.update(layout("scan"))
-                    time.sleep(0.2)
                 continue
 
-            now = time.time()
-            
-            # Full rescan every 30 seconds
-            if now - last_full >= 30:
-                prog.update(tid, advance=0, description=f"[bold blue]Rescan #{scan_count}: Full[/bold blue]")
-                failed = []
-                batch_scanned = 0
-                for i in range(0, len(batches), WORKERS):
-                    if stop_event.is_set():
-                        break
-                    group = batches[i:i+WORKERS]
-                    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                        futs = {ex.submit(fetch_batch, b): b for b in group}
-                        for f in as_completed(futs):
-                            try:
-                                raw = f.result()
-                                parsed = parse_results(raw)
-                                if parsed:
-                                    cache.update(parsed)
-                                else:
-                                    failed.append(futs[f])
-                            except Exception:
-                                failed.append(futs[f])
-                            batch_scanned += len(futs[f])
-                            prog.update(tid, advance=len(futs[f]),
-                                        description=f"[blue]Rescan #{scan_count}: {batch_scanned}/{len(symbols)}[/blue]")
-                    time.sleep(BATCH_DELAY)
-                
-                if failed:
-                    time.sleep(3)
-                    for i in range(0, len(failed), WORKERS):
-                        if stop_event.is_set():
-                            break
-                        group = failed[i:i+WORKERS]
-                        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                            futs = {ex.submit(fetch_batch, b): b for b in group}
-                            for f in as_completed(futs):
-                                try:
-                                    raw = f.result()
-                                    parsed = parse_results(raw)
-                                    if parsed:
-                                        cache.update(parsed)
-                                except Exception:
-                                    pass
-                        time.sleep(0.3)
-                last_full = now
-            else:
-                # Quick refresh: top 20 stocks only
-                prog.update(tid, advance=0, description=f"[blue]Rescan #{scan_count}: Quick top[/bold blue]")
-                top = cache.top_n(TOP_N)
-                top_syms = [r["symbol"] for r in top]
-                if top_syms:
-                    try:
-                        raw = fetch_batch(top_syms)
-                        parsed = parse_results(raw)
-                        if parsed:
-                            cache.update(parsed)
-                    except Exception:
-                        pass
+            top = cache.top_n(TOP_N)
+            top_syms = [r["symbol"] for r in top]
 
-            cache.save()
-            live.update(layout("scan"))
+            if top_syms:
+                try:
+                    raw = fetch_batch(top_syms)
+                    results = parse_results(raw)
+                    if results:
+                        for r in results:
+                            sym = r["symbol"]
+                            new_price = r["price"]
+                            old_price = prev_prices.get(sym)
+                            if old_price is not None and new_price != old_price:
+                                tick_count += 1
+                            prev_prices[sym] = new_price
+                        cache.update(results)
+                        if tick_count % 10 == 0:
+                            cache.save()
+                except Exception:
+                    pass
+
+            live.update(layout("tick"))
             
-            # Wait 3 seconds between refreshes
             for _ in range(30):
                 if stop_event.is_set():
                     break
@@ -411,39 +291,44 @@ def run_scanner(symbols, cache):
 
 
 def main():
+    console = Console()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     txt_path = os.path.join(script_dir, "master_list.txt")
 
-    symbols = load_symbols(txt_path)
-    if not symbols:
-        print(f"No symbols in {txt_path}")
+    if not os.path.exists(txt_path):
+        console.print(f"[red]No master_list.txt found[/red]")
         sys.exit(1)
+
+    with open(txt_path, "r") as f:
+        total_symbols = len([line for line in f if line.strip()])
+
+    cache = StockCache()
+    
+    if not cache.load():
+        console.print("[red]No cache found! Run cache_scanner.py first.[/red]")
+        console.print("[yellow]Command: python cache_scanner.py[/yellow]")
+        sys.exit(1)
+
+    cache_count = cache.count()
+    last_scan = cache.get_last_scan()
+    
+    console.print(f"[bold green]Momentum Scanner[/bold green] | "
+                  f"{cache_count} cached | {total_symbols} total | "
+                  f"Last: {last_scan[:16] if last_scan else 'Never'}")
+    console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+[/dim]")
+    console.print(f"[bold yellow]SPACE pause | T stop[/bold yellow]")
 
     threading.Thread(target=key_listener, daemon=True).start()
 
-    console = Console()
-    console.print(
-        f"[bold green]Momentum Scanner[/bold green] | "
-        f"{len(symbols)} symbols | "
-        f"{MIN_CHANGE_PCT}%+ | "
-        f"${MIN_PRICE}-${MAX_PRICE} | "
-        f"Vol>1M | Float>2M | "
-        f"[bold yellow]SPACE pause | T stop[/bold yellow]"
-    )
-
-    cache = StockCache()
     while True:
         try:
-            run_scanner(symbols, cache)
+            run_scanner(cache, total_symbols)
         except KeyboardInterrupt:
             stop_event.set()
-            try:
-                console.print("\n[bold red]Stopped.[/bold red]")
-            except Exception:
-                pass
+            console.print("\n[bold red]Stopped.[/bold red]")
             break
         except Exception as e:
-            console.print(f"[bold red]Error: {e}. Retry 5s...[/bold red]")
+            console.print(f"[red]Error: {e}. Retry 5s...[/red]")
             time.sleep(5)
 
 
