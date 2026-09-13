@@ -1,6 +1,6 @@
 """
-Momentum Scanner - FAST
-Uses Webull CLI snapshot endpoint in large batches for speed
+Momentum Scanner - Webull CLI
+Fast batch scanning with live top-movers display
 """
 import os
 import sys
@@ -9,8 +9,6 @@ import time
 import subprocess
 import threading
 import signal
-import sqlite3
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
@@ -23,24 +21,27 @@ from rich.table import Table
 # ==========================================
 # CONFIG
 # ==========================================
-WEBULL_PATH = r"C:\Users\sophi\go\bin\webull.exe"
-MIN_PRICE = 2.00
-MAX_PRICE = 2000.00
-MIN_CHANGE_PCT = 2.0
-MIN_VOLUME = 1_000_000
-MIN_FLOAT = 2_000_000
-TOP_N = 20
+WEBULL = r"C:\Users\sophi\go\bin\webull.exe"
+TIMEOUT = 20
 WORKERS = 2
-BATCH_SIZE = 50
-STOCK_DB = "stock_cache.db"
-HTTP_TIMEOUT = 20
+BATCH = 50
+TOP = 20
+DB = "stock_cache.db"
 
-paused = threading.Event()
-stop_event = threading.Event()
+# Filters (live-editable)
+f_price_min = 2.0
+f_price_max = 2000.0
+f_change_min = 2.0
+f_volume_min = 1_000_000
+f_float_min = 2_000_000
+
+# State
+is_paused = threading.Event()
+shutdown = threading.Event()
 
 
 def signal_handler(sig, frame):
-    stop_event.set()
+    shutdown.set()
 
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -48,47 +49,46 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def key_listener():
     import msvcrt
-    global MIN_PRICE, MAX_PRICE, MIN_CHANGE_PCT, MIN_VOLUME, MIN_FLOAT
-    while not stop_event.is_set():
+    while not shutdown.is_set():
         if msvcrt.kbhit():
             key = msvcrt.getch()
             if key == b" ":
-                if paused.is_set():
-                    paused.clear()
+                if is_paused.is_set():
+                    is_paused.clear()
                 else:
-                    paused.set()
+                    is_paused.set()
             elif key == b"t":
-                stop_event.set()
+                shutdown.set()
                 break
             elif key == b"f":
-                paused.set()
+                is_paused.set()
                 time.sleep(0.2)
+                global f_price_min, f_price_max, f_change_min, f_volume_min, f_float_min
                 print("\n--- FILTER MODE ---")
-                print(f"Current: Price ${MIN_PRICE}-${MAX_PRICE} | Change {MIN_CHANGE_PCT}%+ | Volume {MIN_VOLUME/1e6:.1f}M+ | Float {MIN_FLOAT/1e6:.1f}M+")
+                print(f"Current: ${f_price_min}-${f_price_max} | {f_change_min}%+ | Vol {f_volume_min/1e6:.1f}M+ | Float {f_float_min/1e6:.1f}M+")
                 print("Press Enter to keep current value")
                 try:
-                    val = input(f"Min Price [{MIN_PRICE}]: ").strip()
-                    if val: MIN_PRICE = float(val)
-                    val = input(f"Max Price [{MAX_PRICE}]: ").strip()
-                    if val: MAX_PRICE = float(val)
-                    val = input(f"Min Change% [{MIN_CHANGE_PCT}]: ").strip()
-                    if val: MIN_CHANGE_PCT = float(val)
-                    val = input(f"Min Volume (M) [{MIN_VOLUME/1e6:.1f}]: ").strip()
-                    if val: MIN_VOLUME = float(val) * 1e6
-                    val = input(f"Min Float (M) [{MIN_FLOAT/1e6:.1f}]: ").strip()
-                    if val: MIN_FLOAT = float(val) * 1e6
-                    print(f"\nNew filters: Price ${MIN_PRICE}-${MAX_PRICE} | Change {MIN_CHANGE_PCT}%+ | Volume {MIN_VOLUME/1e6:.1f}M+ | Float {MIN_FLOAT/1e6:.1f}M+")
+                    v = input(f"Min Price [{f_price_min}]: ").strip()
+                    if v: f_price_min = float(v)
+                    v = input(f"Max Price [{f_price_max}]: ").strip()
+                    if v: f_price_max = float(v)
+                    v = input(f"Min Change% [{f_change_min}]: ").strip()
+                    if v: f_change_min = float(v)
+                    v = input(f"Min Volume M [{f_volume_min/1e6:.1f}]: ").strip()
+                    if v: f_volume_min = float(v) * 1e6
+                    v = input(f"Min Float M [{f_float_min/1e6:.1f}]: ").strip()
+                    if v: f_float_min = float(v) * 1e6
+                    print(f"New: ${f_price_min}-${f_price_max} | {f_change_min}%+ | Vol {f_volume_min/1e6:.1f}M+ | Float {f_float_min/1e6:.1f}M+")
                 except Exception:
-                    print("Invalid input, keeping current filters")
-                paused.clear()
+                    print("Invalid, keeping current")
+                is_paused.clear()
         time.sleep(0.05)
 
 
 def load_symbols():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    txt_path = os.path.join(script_dir, "master_list.txt")
-    if os.path.exists(txt_path):
-        with open(txt_path, "r") as f:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "master_list.txt")
+    if os.path.exists(path):
+        with open(path) as f:
             return [line.strip().upper() for line in f if line.strip()]
     return []
 
@@ -98,9 +98,9 @@ def fetch_batch(symbols):
     for attempt in range(3):
         try:
             result = subprocess.run(
-                [WEBULL_PATH, "data", "stock", "snapshot",
+                [WEBULL, "data", "stock", "snapshot",
                  "--symbol", sym_str, "--extend-hour", "--overnight"],
-                capture_output=True, text=True, timeout=HTTP_TIMEOUT,
+                capture_output=True, text=True, timeout=TIMEOUT,
                 encoding="utf-8", errors="replace",
             )
             if result.returncode == 0 and result.stdout.strip():
@@ -110,44 +110,41 @@ def fetch_batch(symbols):
                     continue
                 if isinstance(data, list):
                     return data
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
             time.sleep(2)
     return []
 
 
-def parse_results(raw):
+def parse(raw):
     out = []
     for item in raw:
         try:
             price = float(item.get("price", 0))
-            pre = float(item.get("pre_close", 0))
+            prev = float(item.get("pre_close", 0))
             vol = int(item.get("volume", 0))
             sym = item.get("symbol", "")
-            pct = float(item.get("change_ratio", 0)) * 100
-            fp = float(item.get("out_standing_shares", 0)) if item.get("out_standing_shares") else 0
-            inst_id = item.get("instrument_id", "")
+            chg = float(item.get("change_ratio", 0)) * 100
+            flt = float(item.get("out_standing_shares", 0)) if item.get("out_standing_shares") else 0
             ep = item.get("extend_hour_last_price")
             ec = item.get("extend_hour_change_ratio")
             op = item.get("ovn_price")
             oc = item.get("ovn_change_ratio")
-            if price >= MIN_PRICE and price <= MAX_PRICE and pct >= MIN_CHANGE_PCT and pre > 0:
+            if (price >= f_price_min and price <= f_price_max
+                    and chg >= f_change_min and prev > 0):
                 out.append({
-                    "symbol": sym, "instrument_id": inst_id,
-                    "price": price, "prev_close": pre,
-                    "change_pct": pct, "volume": vol, "float": fp,
+                    "symbol": sym, "price": price, "prev_close": prev,
+                    "change_pct": chg, "volume": vol, "float": flt,
                     "ext_price": float(ep) if ep else None,
-                    "ext_change_pct": float(ec) * 100 if ec else None,
-                    "ext_vol": None,
+                    "ext_change": float(ec) * 100 if ec else None,
                     "ovn_price": float(op) if op else None,
-                    "ovn_change_pct": float(oc) * 100 if oc else None,
-                    "ovn_vol": None,
+                    "ovn_change": float(oc) * 100 if oc else None,
                 })
         except (ValueError, TypeError):
             continue
     return out
 
 
-class StockCache:
+class Cache:
     def __init__(self):
         self._data = {}
         self._lock = threading.Lock()
@@ -157,7 +154,7 @@ class StockCache:
             for r in results:
                 self._data[r["symbol"]] = r
 
-    def top_n(self, n=TOP_N):
+    def top(self, n=TOP):
         with self._lock:
             items = list(self._data.values())
         return sorted(items, key=lambda x: x["change_pct"], reverse=True)[:n]
@@ -167,9 +164,18 @@ class StockCache:
             return len(self._data)
 
 
-def build_table(results, scanned, total, mode="scan", tick_count=0, cache_count=0):
-    paused_str = "[bold yellow]PAUSED[/bold yellow]" if paused.is_set() else "[bold green]LIVE[/bold green]"
-    title = f"[{mode.upper()}] Top {TOP_N} | {MIN_CHANGE_PCT}%+ | {scanned}/{total} | Cache: {cache_count} | Ticks:{tick_count} | {paused_str}"
+def fmt_float(val):
+    if val >= 1e9: return f"{val/1e9:.1f}B"
+    if val >= 1e6: return f"{val/1e6:.1f}M"
+    if val >= 1e3: return f"{val/1e3:.0f}K"
+    return str(val) if val > 0 else "-"
+
+
+def build_table(results, scanned, total, mode="scan", changes=0):
+    status = "[bold yellow]PAUSED[/bold yellow]" if is_paused.is_set() else "[bold green]LIVE[/bold green]"
+    title = (f"[{mode.upper()}] Top {TOP} | {f_change_min}%+ | "
+             f"{scanned}/{total} | Cache: {Cache().count()} | "
+             f"Changes: {changes} | {status}")
 
     t = Table(title=title, expand=True)
     t.add_column("#", style="dim", width=4, justify="center")
@@ -183,141 +189,119 @@ def build_table(results, scanned, total, mode="scan", tick_count=0, cache_count=
     t.add_column("Vol", style="dim", width=12, justify="right")
     t.add_column("Float", style="dim", width=10, justify="right")
 
-    for i, r in enumerate(results[:TOP_N], 1):
+    for i, r in enumerate(results[:TOP], 1):
         ep = f"${r['ext_price']:.2f}" if r.get("ext_price") else "-"
-        ec = f"{r['ext_change_pct']:+.2f}%" if r.get("ext_change_pct") is not None else "-"
+        ec = f"{r['ext_change']:+.2f}%" if r.get("ext_change") is not None else "-"
         op = f"${r['ovn_price']:.2f}" if r.get("ovn_price") else "-"
-        oc = f"{r['ovn_change_pct']:+.2f}%" if r.get("ovn_change_pct") is not None else "-"
-        fl = r.get("float", 0)
-        fl_str = f"{fl/1e6:.1f}M" if fl >= 1e6 else (f"{fl/1e3:.0f}K" if fl >= 1e3 else str(fl)) if fl > 0 else "-"
+        oc = f"{r['ovn_change']:+.2f}%" if r.get("ovn_change") is not None else "-"
         t.add_row(
             str(i), r["symbol"], f"${r['price']:.2f}", f"+{r['change_pct']:.2f}%",
-            ep, ec, op, oc, f"{r['volume']:,}", fl_str,
+            ep, ec, op, oc, f"{r['volume']:,}", fmt_float(r.get("float", 0)),
         )
     return t
 
 
 def run_scanner(symbols, total):
     console = Console()
-    cache = StockCache()
-    tick_count = 0
-    prev_prices = {}
-    batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+    cache = Cache()
+    price_changes = 0
+    last_prices = {}
+    batches = [symbols[i:i+BATCH] for i in range(0, len(symbols), BATCH)]
 
-    prog = Progress(
+    progress = Progress(
         TextColumn("[bold blue]{task.description}"),
         BarColumn(bar_width=None),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeRemainingColumn(),
     )
-    tid = prog.add_task("Starting...", total=total)
+    task_id = progress.add_task("Starting...", total=total)
 
-    def layout(mode="scan"):
-        top = cache.top_n(TOP_N)
-        tbl = build_table(top, cache.count(), total, mode, tick_count, cache.count())
-        lo = Layout()
-        lo.split_column(
-            Layout(Panel(prog, title=f"[{mode.upper()}]"), size=5),
-            Layout(Panel(tbl, title="Results")),
+    def make_layout(mode="scan"):
+        top = cache.top(TOP)
+        table = build_table(top, cache.count(), total, mode, price_changes)
+        layout = Layout()
+        layout.split_column(
+            Layout(Panel(progress, title=f"[{mode.upper()}]"), size=5),
+            Layout(Panel(table, title="Results")),
         )
-        return lo
+        return layout
 
-    with Live(layout(), console=console, refresh_per_second=4, screen=True) as live:
-        # Phase 1: Full scan - 4 workers, 100 per batch, fast
+    def apply_batch_results(raw):
+        nonlocal price_changes
+        results = parse(raw)
+        if results:
+            for r in results:
+                sym = r["symbol"]
+                new = r["price"]
+                old = last_prices.get(sym)
+                if old is not None and new != old:
+                    price_changes += 1
+                last_prices[sym] = new
+            cache.update(results)
+
+    with Live(make_layout(), console=console, refresh_per_second=4, screen=True) as live:
+        # Phase 1: Initial full scan
         scanned = 0
         for i in range(0, len(batches), 4):
-            if stop_event.is_set():
+            if shutdown.is_set():
                 break
-            if paused.is_set():
-                while paused.is_set():
-                    live.update(layout())
-                    time.sleep(0.2)
+            while is_paused.is_set():
+                live.update(make_layout())
+                time.sleep(0.2)
 
             group = batches[i:i+4]
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                futs = {ex.submit(fetch_batch, b): b for b in group}
-                for f in as_completed(futs):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(fetch_batch, b): b for b in group}
+                for future in as_completed(futures):
                     try:
-                        raw = f.result()
-                        results = parse_results(raw)
-                        if results:
-                            for r in results:
-                                sym = r["symbol"]
-                                new_price = r["price"]
-                                old_price = prev_prices.get(sym)
-                                if old_price is not None and new_price != old_price:
-                                    tick_count += 1
-                                prev_prices[sym] = new_price
-                            cache.update(results)
+                        apply_batch_results(future.result())
                     except Exception:
                         pass
-                    scanned += len(futs[f])
+                    scanned += len(futures[future])
                     pct = (scanned / total * 100) if total > 0 else 0
                     filled = int(20 * scanned / total) if total > 0 else 0
                     bar = "█" * filled + "░" * (20 - filled)
-                    prog.update(tid, advance=0, description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
-            live.update(layout("scan"))
+                    progress.update(task_id, advance=0,
+                                   description=f"Scanning: {scanned}/{total} {bar} {pct:.0f}%")
+            live.update(make_layout("scan"))
             time.sleep(1.5)
 
-        # Phase 2: Live updates - top stocks every 2s, full rescan every 15s
-        last_full_rescan = time.time()
-        while not stop_event.is_set():
-            if paused.is_set():
-                while paused.is_set():
-                    live.update(layout())
-                    time.sleep(0.2)
-                continue
+        # Phase 2: Live loop - top refresh every 2s, full rescan every 15s
+        last_rescan = time.time()
+        while not shutdown.is_set():
+            while is_paused.is_set():
+                live.update(make_layout())
+                time.sleep(0.2)
 
-            # Quick refresh top 20 every 2 seconds
-            top = cache.top_n(TOP_N)
+            # Quick: refresh top stocks every 2s
+            top = cache.top(TOP)
             top_syms = [r["symbol"] for r in top]
             if top_syms:
                 try:
-                    raw = fetch_batch(top_syms)
-                    results = parse_results(raw)
-                    if results:
-                        for r in results:
-                            sym = r["symbol"]
-                            new_price = r["price"]
-                            old_price = prev_prices.get(sym)
-                            if old_price is not None and new_price != old_price:
-                                tick_count += 1
-                            prev_prices[sym] = new_price
-                        cache.update(results)
+                    apply_batch_results(fetch_batch(top_syms))
                 except Exception:
                     pass
 
-            live.update(layout("tick"))
+            live.update(make_layout("tick"))
 
-            # Full rescan every 15 seconds
-            if time.time() - last_full_rescan >= 15:
-                last_full_rescan = time.time()
+            # Slow: full rescan every 15s
+            if time.time() - last_rescan >= 15:
+                last_rescan = time.time()
                 for i in range(0, len(batches), 2):
-                    if stop_event.is_set() or paused.is_set():
+                    if shutdown.is_set() or is_paused.is_set():
                         break
                     group = batches[i:i+2]
-                    with ThreadPoolExecutor(max_workers=2) as ex:
-                        futs = {ex.submit(fetch_batch, b): b for b in group}
-                        for f in as_completed(futs):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        futures = {pool.submit(fetch_batch, b): b for b in group}
+                        for future in as_completed(futures):
                             try:
-                                raw = f.result()
-                                results = parse_results(raw)
-                                if results:
-                                    for r in results:
-                                        sym = r["symbol"]
-                                        new_price = r["price"]
-                                        old_price = prev_prices.get(sym)
-                                        if old_price is not None and new_price != old_price:
-                                            tick_count += 1
-                                        prev_prices[sym] = new_price
-                                    cache.update(results)
+                                apply_batch_results(future.result())
                             except Exception:
                                 pass
-                    live.update(layout("rescan"))
+                    live.update(make_layout("rescan"))
 
-            # Wait 2 seconds before next top stock refresh
             for _ in range(20):
-                if stop_event.is_set():
+                if shutdown.is_set():
                     break
                 time.sleep(0.1)
 
@@ -329,9 +313,9 @@ def main():
         console.print("[red]No symbols found[/red]")
         sys.exit(1)
 
-    console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols | 4 workers")
-    console.print(f"[dim]Filters: ${MIN_PRICE}+ | Vol>1M | Float>2M | {MIN_CHANGE_PCT}%+[/dim]")
-    console.print(f"[bold yellow]SPACE pause | T stop[/bold yellow]")
+    console.print(f"[bold green]Momentum Scanner[/bold green] | {len(symbols)} symbols")
+    console.print(f"[dim]Filters: ${f_price_min}+ | Vol>1M | Float>2M | {f_change_min}%+[/dim]")
+    console.print("[bold yellow]SPACE pause | T stop | F filters[/bold yellow]")
 
     threading.Thread(target=key_listener, daemon=True).start()
 
@@ -339,7 +323,7 @@ def main():
         try:
             run_scanner(symbols, len(symbols))
         except KeyboardInterrupt:
-            stop_event.set()
+            shutdown.set()
             console.print("\n[bold red]Stopped.[/bold red]")
             break
         except Exception as e:
